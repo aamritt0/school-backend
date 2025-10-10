@@ -1,75 +1,82 @@
-require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const ical = require('node-ical');
 const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
 
 const ICS_URL = process.env.ICS_URL;
-const CACHE_INTERVAL = 2 * 60 * 1000; // 2 minutes
 
-let todayCache = {}; // { section: [events] }
+// Cache to avoid re-downloading ICS too often
+let cachedEvents = [];
 let lastFetch = 0;
+const CACHE_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
-// Function to fetch ICS and precompute today's events per section
-async function updateCache() {
+async function fetchICS() {
   const now = Date.now();
-  if (now - lastFetch < CACHE_INTERVAL) return; // Cache is still fresh
+  if (now - lastFetch < CACHE_INTERVAL && cachedEvents.length > 0) {
+    console.log('✅ Using cached ICS data');
+    return cachedEvents;
+  }
 
   console.log('🌐 Fetching new ICS data...');
-  try {
-    const res = await axios.get(ICS_URL);
-    const events = Object.values(ical.parseICS(res.data)).filter(e => e.type === 'VEVENT');
+  const res = await axios.get(ICS_URL);
+  const events = ical.parseICS(res.data);
 
-    const today = new Date().toISOString().split('T')[0];
-    const newCache = {};
+  // Keep only relevant events (±7 days from today)
+  const today = new Date();
+  const oneWeekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const oneWeekAhead = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-    events.forEach(e => {
-      const eventDate = e.start.toISOString().split('T')[0];
-      if (eventDate !== today) return; // Only keep today's events
+  cachedEvents = Object.values(events).filter(e =>
+    e.type === 'VEVENT' &&
+    e.start &&
+    e.start >= oneWeekAgo &&
+    e.start <= oneWeekAhead
+  );
 
-      const text = (e.summary || '') + ' ' + (e.description || '');
-      const matches = text.match(/\b\d[A-Z]{1,4}\b/g); // Detect sections like 3B, 5AIIN, etc.
-      if (!matches) return;
-
-      matches.forEach(section => {
-        if (!newCache[section]) newCache[section] = [];
-        newCache[section].push(e);
-      });
-    });
-
-    todayCache = newCache;
-    lastFetch = now;
-  } catch (err) {
-    console.error('Failed to fetch ICS:', err.message);
-  }
+  lastFetch = now;
+  console.log(`📅 Cached ${cachedEvents.length} recent events`);
+  return cachedEvents;
 }
 
-// Initial fetch + auto-refresh every CACHE_INTERVAL
-updateCache();
-setInterval(updateCache, CACHE_INTERVAL);
+app.get('/events', async (req, res) => {
+  try {
+    const { section, date } = req.query;
+    if (!section || !date) {
+      return res.status(400).send('Missing section or date');
+    }
 
-// Serve events instantly from memory
-app.get('/events', (req, res) => {
-  const { section } = req.query;
-  if (!section) return res.status(400).send('Missing section');
+    const events = await fetchICS();
 
-  const events = todayCache[section] || [];
-  res.json(events.map(e => ({
-    id: e.uid,
-    summary: e.summary,
-    description: e.description,
-    start: e.start,
-    end: e.end
-  })));
+    const filtered = events.filter(e => {
+      const eventDate = e.start.toISOString().split('T')[0];
+      return (
+        eventDate === date &&
+        ((e.summary && e.summary.includes(section)) ||
+          (e.description && e.description.includes(section)))
+      );
+    });
+
+    res.json(
+      filtered.map(e => ({
+        id: e.uid,
+        summary: e.summary,
+        description: e.description,
+        start: e.start,
+        end: e.end,
+      }))
+    );
+  } catch (err) {
+    console.error('❌ Error fetching events:', err.message);
+    res.status(500).send('Failed to fetch events');
+  }
 });
 
-// Optional: route to force refresh manually
-app.get('/force-refresh', async (req, res) => {
-  await updateCache();
-  res.send('Cache refreshed!');
-});
-
-app.listen(3000, '0.0.0.0', () => console.log('Server running on port 3000'));
+// Render uses PORT environment variable automatically
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
