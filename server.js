@@ -43,37 +43,38 @@ async function fetchICS() {
 }
 
 app.get('/events', async (req, res) => {
-  try {
-    const { section, date } = req.query;
-    if (!section || !date) {
-      return res.status(400).send('Missing section or date');
-    }
+  const { section, date } = req.query;
+  console.log('Received request:', section, date); // <- add this
 
+  if (!section || !date) return res.status(400).send('Missing section or date');
+
+  try {
+    console.log('Fetching ICS...');
     const events = await fetchICS();
+    console.log('Fetched events:', events.length);
 
     const filtered = events.filter(e => {
       const eventDate = e.start.toISOString().split('T')[0];
-      return (
-        eventDate === date &&
-        ((e.summary && e.summary.includes(section)) ||
-          (e.description && e.description.includes(section)))
-      );
+      return eventDate === date &&
+             ((e.summary && e.summary.includes(section)) ||
+              (e.description && e.description.includes(section)));
     });
 
-    res.json(
-      filtered.map(e => ({
-        id: e.uid,
-        summary: e.summary,
-        description: e.description,
-        start: e.start,
-        end: e.end,
-      }))
-    );
+    console.log('Filtered events:', filtered.length);
+
+    res.json(filtered.map(e => ({
+      id: e.uid,
+      summary: e.summary,
+      description: e.description,
+      start: e.start,
+      end: e.end
+    })));
   } catch (err) {
-    console.error('❌ Error fetching events:', err.message);
-    res.status(500).send('Failed to fetch events');
+    console.error('Error fetching ICS:', err.message);
+    res.status(500).send('Failed to fetch ICS');
   }
 });
+
 
 // Render uses PORT environment variable automatically
 const PORT = process.env.PORT || 3000;
