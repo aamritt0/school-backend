@@ -5,79 +5,65 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' })); // allow all origins
 
-const ICS_URL = process.env.ICS_URL;
+const ICS_URL = process.env.ICS_URL || 'YOUR_ICS_URL_HERE';
 
-// Cache to avoid re-downloading ICS too often
-let cachedEvents = [];
-let lastFetch = 0;
-const CACHE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+// Cache today’s events
+let cachedEvents = {};
+let lastFetchDay = '';
 
 async function fetchICS() {
-  const now = Date.now();
-  if (now - lastFetch < CACHE_INTERVAL && cachedEvents.length > 0) {
-    console.log('✅ Using cached ICS data');
+  const today = new Date().toISOString().split('T')[0];
+
+  // If already cached for today, return cache
+  if (lastFetchDay === today) return cachedEvents;
+
+  try {
+    const res = await axios.get(ICS_URL);
+    const events = Object.values(ical.parseICS(res.data)).filter(e => e.type === 'VEVENT');
+
+    // Build cache: { section: [events] }
+    cachedEvents = {};
+    events.forEach(e => {
+      const eventDate = e.start.toISOString().split('T')[0];
+      if (eventDate !== today) return;
+
+      // Parse sections from summary or description
+      const text = `${e.summary || ''} ${e.description || ''}`;
+      const matches = text.match(/\b[0-9A-Z]+\b/g); // crude section detection
+      if (matches) {
+        matches.forEach(section => {
+          if (!cachedEvents[section]) cachedEvents[section] = [];
+          cachedEvents[section].push({
+            id: e.uid,
+            summary: e.summary,
+            description: e.description,
+            start: e.start,
+            end: e.end,
+          });
+        });
+      }
+    });
+
+    lastFetchDay = today;
+    console.log('Fetched and cached today’s ICS events.');
     return cachedEvents;
+  } catch (err) {
+    console.error('Error fetching ICS:', err.message);
+    return {};
   }
-
-  console.log('🌐 Fetching new ICS data...');
-  const res = await axios.get(ICS_URL);
-  const events = ical.parseICS(res.data);
-
-  // Keep only relevant events (±7 days from today)
-  const today = new Date();
-  const oneWeekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const oneWeekAhead = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-  cachedEvents = Object.values(events).filter(e =>
-    e.type === 'VEVENT' &&
-    e.start &&
-    e.start >= oneWeekAgo &&
-    e.start <= oneWeekAhead
-  );
-
-  lastFetch = now;
-  console.log(`📅 Cached ${cachedEvents.length} recent events`);
-  return cachedEvents;
 }
 
 app.get('/events', async (req, res) => {
-  const { section, date } = req.query;
-  console.log('Received request:', section, date); // <- add this
+  const { section } = req.query;
+  if (!section) return res.status(400).json({ error: 'Missing section' });
 
-  if (!section || !date) return res.status(400).send('Missing section or date');
-
-  try {
-    console.log('Fetching ICS...');
-    const events = await fetchICS();
-    console.log('Fetched events:', events.length);
-
-    const filtered = events.filter(e => {
-      const eventDate = e.start.toISOString().split('T')[0];
-      return eventDate === date &&
-             ((e.summary && e.summary.includes(section)) ||
-              (e.description && e.description.includes(section)));
-    });
-
-    console.log('Filtered events:', filtered.length);
-
-    res.json(filtered.map(e => ({
-      id: e.uid,
-      summary: e.summary,
-      description: e.description,
-      start: e.start,
-      end: e.end
-    })));
-  } catch (err) {
-    console.error('Error fetching ICS:', err.message);
-    res.status(500).send('Failed to fetch ICS');
-  }
+  const eventsBySection = await fetchICS();
+  const events = eventsBySection[section] || [];
+  res.json(events);
 });
 
-
-// Render uses PORT environment variable automatically
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () =>
-  console.log(`🚀 Server running on port ${PORT}`)
-);
+// Port
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
