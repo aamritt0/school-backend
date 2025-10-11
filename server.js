@@ -1,205 +1,160 @@
-// server.js
-// Express + streamed ICS parser optimized for Koyeb Free tier
-
 const express = require('express');
-const https = require('https');
-const readline = require('readline');
+const axios = require('axios');
+const ical = require('node-ical');
 const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({ origin: '*' })); // allow all origins
+app.use(cors({ origin: '*' }));
 
-// Env
+// ENV
 const ICS_URL = process.env.ICS_URL;
 if (!ICS_URL) {
-  console.error('ICS_URL not set');
+  console.error('❌ ICS_URL not set');
   process.exit(1);
 }
 
-// Cache: today only
-let cachedEvents = {};
-let lastFetchDay = '';
-
-// Health endpoint for Koyeb HTTP health checks
+// Health endpoint for Koyeb
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Utilities
-function cleanKey(key) {
-  // Strip parameters: DTSTART;TZID=Europe/Rome -> DTSTART
-  const i = key.indexOf(';');
-  return i === -1 ? key : key.slice(0, i);
+// Axios client with safety limits (Free tier friendly)
+const http = axios.create({
+  timeout: 30000,                      // 30s to tolerate slow ICS hosts
+  maxContentLength: 5 * 1024 * 1024,   // 5 MB cap
+  maxBodyLength: 5 * 1024 * 1024,
+  responseType: 'text',
+  validateStatus: (s) => s >= 200 && s < 400, // allow simple redirects
+});
+
+// Cached parsed events (last fetch time + today breakdown)
+let cachedRecent = [];           // 7-day window list for the legacy endpoint
+let lastFetchMs = 0;
+const CACHE_MS = 5 * 60 * 1000;  // 5 minutes
+
+let cachedByDay = {};            // { 'YYYY-MM-DD': { SECTION: [events] } }
+let lastDayBuilt = '';           // date stamp of cachedByDay
+
+function minimal(e) {
+  return {
+    id: e.uid,
+    summary: e.summary || '',
+    description: e.description || '',
+    start: e.start,
+    end: e.end,
+  };
 }
 
-function parseICSToDate(dtstr) {
-  if (!dtstr) return null;
-  // UTC: YYYYMMDDTHHMMSSZ
-  if (/^\d{8}T\d{6}Z$/.test(dtstr)) return new Date(dtstr);
-  // Local time: YYYYMMDDTHHMMSS
-  if (/^\d{8}T\d{6}$/.test(dtstr)) {
-    const y = dtstr.slice(0, 4);
-    const m = dtstr.slice(4, 6);
-    const d = dtstr.slice(6, 8);
-    const hh = dtstr.slice(9, 11);
-    const mm = dtstr.slice(11, 13);
-    const ss = dtstr.slice(13, 15);
-    return new Date(`${y}-${m}-${d}T${hh}:${mm}:${ss}`);
+async function fetchICSOnce() {
+  const res = await http.get(ICS_URL);
+  // follow one redirect manually if needed
+  if (res.status >= 300 && res.status < 400 && res.headers?.location) {
+    const res2 = await http.get(res.headers.location);
+    return res2.data;
   }
-  // All-day: YYYYMMDD
-  if (/^\d{8}$/.test(dtstr)) {
-    const y = dtstr.slice(0, 4);
-    const m = dtstr.slice(4, 6);
-    const d = dtstr.slice(6, 8);
-    return new Date(`${y}-${m}-${d}T00:00:00`);
+  return res.data;
+}
+
+// Parse and maintain both caches
+async function refreshCaches() {
+  const now = Date.now();
+  if (now - lastFetchMs < CACHE_MS && cachedRecent.length) {
+    return;
   }
-  // Fallback
-  return new Date(dtstr);
+
+  const raw = await fetchICSOnce();
+  const data = ical.parseICS(raw);
+
+  const today = new Date();
+  const oneWeekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const oneWeekAhead = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+  // Rebuild 7-day recent cache
+  const recent = [];
+  // Rebuild today-by-section cache
+  const todayISO = today.toISOString().split('T')[0];
+  const bySection = {};
+
+  for (const v of Object.values(data)) {
+    if (!v || v.type !== 'VEVENT' || !v.start) continue;
+
+    // 7-day window
+    if (v.start >= oneWeekAgo && v.start <= oneWeekAhead) {
+      recent.push(minimal(v));
+    }
+
+    // Today bucket
+    const d = v.start.toISOString().split('T')[0];
+    if (d === todayISO) {
+      const text = `${v.summary || ''} ${v.description || ''}`;
+      const matches = text.match(/\b[0-9A-Z]+\b/g);
+      if (matches) {
+        const seen = new Set();
+        for (const s of matches) {
+          if (seen.has(s)) continue;
+          seen.add(s);
+          if (!bySection[s]) bySection[s] = [];
+          bySection[s].push(minimal(v));
+        }
+      }
+    }
+  }
+
+  cachedRecent = recent;
+  lastFetchMs = now;
+
+  cachedByDay = { [todayISO]: bySection };
+  lastDayBuilt = todayISO;
+
+  console.log(
+    `🗓️ Cached ${recent.length} recent events; today sections: ${Object.keys(bySection).length}`
+  );
 }
 
-// Stream and parse ICS for today's events only
-async function fetchICS() {
-  const today = new Date().toISOString().split('T')[0];
-  if (lastFetchDay === today) return cachedEvents;
-
-  console.log('Fetching ICS (streamed) ...');
-  cachedEvents = {};
-
-  // Timeouts and size limits to protect memory
-  const MAX_BYTES = 5 * 1024 * 1024; // 5 MB
-  const REQUEST_TIMEOUT_MS = 100000;
-
-  await new Promise((resolve, reject) => {
-    const req = https.get(ICS_URL, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
-        res.resume();
-        return;
-      }
-
-      // Track body size to abort oversized feeds
-      let bytes = 0;
-      res.on('data', (chunk) => {
-        bytes += chunk.length;
-        if (bytes > MAX_BYTES) {
-          req.destroy(new Error('ICS too large'));
-        }
-      });
-
-      // Readlines with CRLF handling
-      const rl = readline.createInterface({ input: res, crlfDelay: Infinity });
-
-      let currentEvent = {};
-      let insideEvent = false;
-
-      // Handle RFC5545 line folding by manual buffering
-      let carry = '';
-
-      function processLine(line) {
-        if (line.startsWith('BEGIN:VEVENT')) {
-          insideEvent = true;
-          currentEvent = {};
-          return;
-        }
-        if (line.startsWith('END:VEVENT')) {
-          insideEvent = false;
-
-          const start = parseICSToDate(currentEvent.start);
-          const end = parseICSToDate(currentEvent.end);
-          if (!start) return;
-
-          const eventDate = start.toISOString().split('T')[0];
-          if (eventDate !== today) return;
-
-          const text = `${currentEvent.summary || ''} ${currentEvent.description || ''}`;
-          const matches = text.match(/\b[0-9A-Z]+\b/g);
-          if (!matches) return;
-
-          const minimal = {
-            id: currentEvent.uid || `${start.getTime()}`,
-            summary: currentEvent.summary || '',
-            description: currentEvent.description || '',
-            start,
-            end,
-          };
-
-          const seen = new Set();
-          for (const section of matches) {
-            if (seen.has(section)) continue;
-            seen.add(section);
-            if (!cachedEvents[section]) cachedEvents[section] = [];
-            cachedEvents[section].push(minimal);
-          }
-          return;
-        }
-        if (!insideEvent) return;
-
-        const idx = line.indexOf(':');
-        if (idx === -1) return;
-        const rawKey = line.slice(0, idx);
-        const value = line.slice(idx + 1);
-        const key = cleanKey(rawKey);
-
-        if (key === 'UID') currentEvent.uid = value;
-        else if (key === 'DTSTART') currentEvent.start = value;
-        else if (key === 'DTEND') currentEvent.end = value;
-        else if (key === 'SUMMARY') currentEvent.summary = value;
-        else if (key === 'DESCRIPTION') currentEvent.description = value;
-      }
-
-      rl.on('line', (raw) => {
-        // Normalize trailing CR for safety
-        const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
-
-        // RFC5545 folding: continuation lines start with space or tab
-        if (line.startsWith(' ') || line.startsWith('\t')) {
-          carry += line.slice(1);
-          return;
-        }
-        if (carry) {
-          processLine(carry);
-          carry = '';
-        }
-        carry = line;
-      });
-
-      rl.on('close', () => {
-        if (carry) processLine(carry);
-        resolve();
-      });
-      rl.on('error', reject);
-    });
-
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error('Request timeout'));
-    });
-    req.on('error', reject);
-  });
-
-  lastFetchDay = today;
-  console.log(`Cached today’s events for ${Object.keys(cachedEvents).length} sections`);
-  return cachedEvents;
-}
-
-// API: /events?section=3B
+// Legacy shape: /events?section=SEC&date=YYYY-MM-DD
 app.get('/events', async (req, res) => {
   try {
-    const { section } = req.query;
-    if (!section) return res.status(400).json({ error: 'Missing section' });
+    const { section, date } = req.query;
 
-    const eventsBySection = await fetchICS();
-    const events = eventsBySection[section] || [];
-    res.json(events);
+    await refreshCaches();
+
+    // 1) Legacy: specific date provided
+    if (section && date) {
+      const filtered = cachedRecent.filter((e) => {
+        const d = e.start && e.start.toISOString().split('T')[0];
+        if (d !== date) return false;
+        const text = `${e.summary} ${e.description}`;
+        return text.includes(section);
+      });
+      return res.json(filtered);
+    }
+
+    // 2) Today-by-section: /events?section=SEC
+    if (section) {
+      const todayISO = new Date().toISOString().split('T')[0];
+      if (lastDayBuilt !== todayISO) {
+        // force rebuild of today's section index if day rolled over
+        await refreshCaches();
+      }
+      const bySection = cachedByDay[todayISO] || {};
+      return res.json(bySection[section] || []);
+    }
+
+    // 3) No params: return recent window (debug)
+    return res.json(cachedRecent);
   } catch (err) {
-    console.error('Handler error:', err.message);
-    // Do not retain large caches on error
-    cachedEvents = {};
-    lastFetchDay = '';
-    res.status(502).json({ error: 'Upstream or parse error' });
+    console.error('Error fetching/parsing ICS:', err.message);
+    // do not retain possibly large caches on persistent errors
+    if (Date.now() - lastFetchMs > CACHE_MS * 2) {
+      cachedRecent = [];
+      cachedByDay = {};
+      lastDayBuilt = '';
+    }
+    return res.status(502).json({ error: 'Upstream or parse error' });
   }
 });
 
 // Server
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
