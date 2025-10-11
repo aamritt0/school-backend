@@ -238,3 +238,4 @@ app.get('/events', async (req, res) => {
     setTimeout(backgroundRefresh, 30000);
   }
 })();
+
