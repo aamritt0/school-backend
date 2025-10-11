@@ -22,7 +22,7 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 // ----- Axios client (used only by background refresh) -----
 const http = axios.create({
-  timeout: 60000,                        // 60s for slow calendar hosts
+  timeout: 150000,                        // 150s for slow calendar hosts
   maxContentLength: 5 * 1024 * 1024,     // 5 MB safety cap
   maxBodyLength: 5 * 1024 * 1024,
   responseType: 'text',
