@@ -1,28 +1,47 @@
 const express = require('express');
-const axios = require('axios');
-const ical = require('node-ical');
+const https = require('https');
+const readline = require('readline');
 const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
 app.use(cors({ origin: '*' })); // allow all origins
 
-const ICS_URL = process.env.ICS_URL || 'YOUR_ICS_URL_HERE';
+const ICS_URL = process.env.ICS_URL;
+if (!ICS_URL) {
+  console.error('❌ Please set ICS_URL in your .env file');
+  process.exit(1);
+}
 
-// Cache today’s events
+// Cache today's events by section
 let cachedEvents = {};
 let lastFetchDay = '';
 
-const https = require('https');
-const readline = require('readline');
+/**
+ * Parse ICS date string into JS Date
+ * Handles:
+ * - All-day events (YYYYMMDD)
+ * - UTC events (YYYYMMDDTHHMMSSZ)
+ */
+function parseICSToDate(dtstr) {
+  if (!dtstr) return null;
+  if (/^\d{8}T\d{6}Z$/.test(dtstr)) return new Date(dtstr);
+  if (/^\d{8}$/.test(dtstr)) {
+    const year = dtstr.slice(0, 4);
+    const month = dtstr.slice(4, 6);
+    const day = dtstr.slice(6, 8);
+    return new Date(`${year}-${month}-${day}T00:00:00`);
+  }
+  return new Date(dtstr); // fallback
+}
 
 async function fetchICS() {
   const today = new Date().toISOString().split('T')[0];
 
-  // If already cached today, return cache
+  // Return cache if already fetched today
   if (lastFetchDay === today) return cachedEvents;
 
-  console.log('Fetching and parsing ICS (streamed)...');
+  console.log('📥 Fetching and parsing ICS (streamed)...');
   cachedEvents = {};
 
   await new Promise((resolve, reject) => {
@@ -43,44 +62,37 @@ async function fetchICS() {
         } else if (line.startsWith('END:VEVENT')) {
           insideEvent = false;
 
-          // Keep only today's events
-          const start = new Date(currentEvent.start);
-          if (!isNaN(start) && start.toISOString().split('T')[0] === today) {
-            const text = `${currentEvent.summary || ''} ${currentEvent.description || ''}`;
-            const matches = text.match(/\b[0-9A-Z]+\b/g);
-            if (matches) {
-              for (const section of matches) {
-                if (!cachedEvents[section]) cachedEvents[section] = [];
-                cachedEvents[section].push({
-                  id: currentEvent.uid || `${section}-${start.getTime()}`,
-                  summary: currentEvent.summary,
-                  description: currentEvent.description,
-                  start,
-                  end: new Date(currentEvent.end),
-                });
-              }
+          // Parse dates
+          const start = parseICSToDate(currentEvent.start);
+          const end = parseICSToDate(currentEvent.end);
+          if (!start) return;
+
+          const eventDate = start.toISOString().split('T')[0];
+          if (eventDate !== today) return;
+
+          // Detect sections from summary/description
+          const text = `${currentEvent.summary || ''} ${currentEvent.description || ''}`;
+          const matches = text.match(/\b[0-9A-Z]+\b/g);
+          if (matches) {
+            for (const section of matches) {
+              if (!cachedEvents[section]) cachedEvents[section] = [];
+              cachedEvents[section].push({
+                id: currentEvent.uid || `${section}-${start.getTime()}`,
+                summary: currentEvent.summary,
+                description: currentEvent.description,
+                start,
+                end,
+              });
             }
           }
         } else if (insideEvent) {
           const [key, ...rest] = line.split(':');
           const value = rest.join(':');
-          switch (true) {
-            case key.startsWith('UID'):
-              currentEvent.uid = value;
-              break;
-            case key.startsWith('DTSTART'):
-              currentEvent.start = value;
-              break;
-            case key.startsWith('DTEND'):
-              currentEvent.end = value;
-              break;
-            case key.startsWith('SUMMARY'):
-              currentEvent.summary = value;
-              break;
-            case key.startsWith('DESCRIPTION'):
-              currentEvent.description = value;
-              break;
-          }
+          if (key.startsWith('UID')) currentEvent.uid = value;
+          else if (key.startsWith('DTSTART')) currentEvent.start = value;
+          else if (key.startsWith('DTEND')) currentEvent.end = value;
+          else if (key.startsWith('SUMMARY')) currentEvent.summary = value;
+          else if (key.startsWith('DESCRIPTION')) currentEvent.description = value;
         }
       });
 
@@ -90,11 +102,11 @@ async function fetchICS() {
   });
 
   lastFetchDay = today;
-  console.log(`✔ Cached today's events for ${Object.keys(cachedEvents).length} sections`);
+  console.log(`✔ Cached today’s events for ${Object.keys(cachedEvents).length} sections`);
   return cachedEvents;
 }
 
-
+// Endpoint: /events?section=3B
 app.get('/events', async (req, res) => {
   const { section } = req.query;
   if (!section) return res.status(400).json({ error: 'Missing section' });
@@ -104,6 +116,6 @@ app.get('/events', async (req, res) => {
   res.json(events);
 });
 
-// Port
+// Start server
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
