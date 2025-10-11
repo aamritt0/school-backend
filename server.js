@@ -1,8 +1,8 @@
-// server.js — Cross-platform version (Windows + Linux/Koyeb) - CORRECTED
+// server.js — Koyeb FREE TIER with MEMORY-EFFICIENT line-by-line parsing
 
 const express = require('express');
 const axios = require('axios');
-const ical = require('node-ical');
+const readline = require('readline');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
@@ -25,6 +25,7 @@ let cachedRecent = [];
 let recentBuiltAt = 0;
 let cachedByDay = {};
 let lastDayBuilt = '';
+let cacheStatus = 'building';
 
 // ----- Helpers -----
 function minimal(e) {
@@ -37,16 +38,122 @@ function minimal(e) {
   };
 }
 
-// Stream download to temp file, then parse
-async function fetchAndParseICS(url, tries = 2) {
-  // Use os.tmpdir() for cross-platform temp directory
+// Parse date from ICS format (YYYYMMDDTHHMMSS or YYYYMMDD)
+function parseICSDate(dateStr) {
+  if (!dateStr) return null;
+  
+  // Remove timezone info
+  dateStr = dateStr.replace(/[TZ]/g, '').split(':')[0];
+  
+  // YYYYMMDD or YYYYMMDDHHMMSS
+  const year = parseInt(dateStr.substring(0, 4));
+  const month = parseInt(dateStr.substring(4, 6)) - 1;
+  const day = parseInt(dateStr.substring(6, 8));
+  const hour = parseInt(dateStr.substring(8, 10)) || 0;
+  const minute = parseInt(dateStr.substring(10, 12)) || 0;
+  
+  return new Date(year, month, day, hour, minute);
+}
+
+// Memory-efficient line-by-line ICS parser
+async function parseICSFileStreaming(filePath) {
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  const now = new Date();
+  const todayISO = now.toISOString().split('T')[0];
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const twoDaysLater = new Date(today.getTime() + 2 * 24 * 60 * 60 * 1000);
+
+  const recent = [];
+  const bySection = {};
+  
+  let totalEvents = 0;
+  let filteredEvents = 0;
+  let inEvent = false;
+  let currentEvent = {};
+
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    
+    if (trimmed === 'BEGIN:VEVENT') {
+      inEvent = true;
+      currentEvent = {};
+    } else if (trimmed === 'END:VEVENT' && inEvent) {
+      inEvent = false;
+      totalEvents++;
+      
+      // Only process if we have a start date
+      if (currentEvent.start) {
+        const startDate = parseICSDate(currentEvent.start);
+        
+        if (startDate && startDate >= today && startDate < twoDaysLater) {
+          const evt = {
+            id: currentEvent.uid || `event-${totalEvents}`,
+            summary: currentEvent.summary || '',
+            description: currentEvent.description || '',
+            start: startDate,
+            end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
+          };
+          
+          recent.push(evt);
+          filteredEvents++;
+          
+          // Check if it's today
+          const d = startDate.toISOString().split('T')[0];
+          if (d === todayISO) {
+            const text = `${evt.summary} ${evt.description}`;
+            const matches = text.match(/\b[0-9A-Z]+\b/g);
+            if (matches) {
+              const seen = new Set();
+              for (const s of matches) {
+                if (seen.has(s)) continue;
+                seen.add(s);
+                if (!bySection[s]) bySection[s] = [];
+                bySection[s].push(evt);
+              }
+            }
+          }
+        }
+      }
+      
+      currentEvent = {};
+      
+      // Log progress every 1000 events
+      if (totalEvents % 1000 === 0) {
+        console.log(`📊 Processed ${totalEvents} events...`);
+      }
+      
+    } else if (inEvent) {
+      // Parse event properties
+      if (trimmed.startsWith('DTSTART')) {
+        currentEvent.start = trimmed.split(':')[1] || trimmed.split('=')[1]?.split(':')[1];
+      } else if (trimmed.startsWith('DTEND')) {
+        currentEvent.end = trimmed.split(':')[1] || trimmed.split('=')[1]?.split(':')[1];
+      } else if (trimmed.startsWith('SUMMARY:')) {
+        currentEvent.summary = trimmed.substring(8);
+      } else if (trimmed.startsWith('DESCRIPTION:')) {
+        currentEvent.description = trimmed.substring(12);
+      } else if (trimmed.startsWith('UID:')) {
+        currentEvent.uid = trimmed.substring(4);
+      }
+    }
+  }
+
+  return { recent, bySection, totalEvents, filteredEvents };
+}
+
+// Stream download to temp file
+async function downloadICS(url, tries = 2) {
   const tempFile = path.join(os.tmpdir(), `calendar-${Date.now()}.ics`);
   
   for (let i = 0; i < tries; i++) {
     try {
-      console.log(`📥 Attempt ${i + 1}/${tries} - streaming calendar to temp file...`);
+      console.log(`📥 Attempt ${i + 1}/${tries} - downloading...`);
       
-      // Stream download with axios - 115s timeout
       const response = await axios({
         method: 'GET',
         url: url,
@@ -62,32 +169,20 @@ async function fetchAndParseICS(url, tries = 2) {
         downloadedBytes += chunk.length;
       });
 
-      // Pipe the response stream to file
       response.data.pipe(writer);
 
-      // Wait for download to complete
       await new Promise((resolve, reject) => {
         writer.on('finish', resolve);
         writer.on('error', reject);
         response.data.on('error', reject);
       });
 
-      console.log(`✅ Downloaded ${Math.round(downloadedBytes / 1024)}KB to temp file`);
-
-      // Parse from file using node-ical's async.parseFile() method
-      console.log(`📦 Parsing ICS file...`);
-      const data = await ical.async.parseFile(tempFile);
-      
-      // Delete temp file
-      fs.unlinkSync(tempFile);
-      console.log(`🗑️ Temp file deleted`);
-
-      return data;
+      console.log(`✅ Downloaded ${Math.round(downloadedBytes / 1024)}KB`);
+      return tempFile;
 
     } catch (e) {
       console.error(`❌ Attempt ${i + 1} failed:`, e.message);
       
-      // Clean up temp file if exists
       if (fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);
       }
@@ -101,67 +196,43 @@ async function fetchAndParseICS(url, tries = 2) {
   }
 }
 
-function rebuildCaches(data) {
-  const now = new Date();
-  const todayISO = now.toISOString().split('T')[0];
+async function fetchAndRebuildCache() {
+  const tempFile = await downloadICS(ICS_URL, 2);
   
-  // 2-day window: today and tomorrow
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const twoDaysLater = new Date(today.getTime() + 2 * 24 * 60 * 60 * 1000);
-
-  const recent = [];
-  const bySection = {};
-  
-  let totalEvents = 0;
-  let filteredEvents = 0;
-
-  for (const v of Object.values(data)) {
-    if (!v || v.type !== 'VEVENT' || !v.start) continue;
-    totalEvents++;
-
-    // Only keep 2-day window in memory (today + tomorrow)
-    if (v.start >= today && v.start < twoDaysLater) {
-      recent.push(minimal(v));
-      filteredEvents++;
+  try {
+    console.log(`📦 Parsing line-by-line (memory-efficient)...`);
+    const { recent, bySection, totalEvents, filteredEvents } = await parseICSFileStreaming(tempFile);
+    
+    cachedRecent = recent;
+    recentBuiltAt = Date.now();
+    cachedByDay = { [new Date().toISOString().split('T')[0]]: bySection };
+    lastDayBuilt = new Date().toISOString().split('T')[0];
+    
+    console.log(
+      `🗓️ Parsed ${totalEvents} total, cached ${filteredEvents} in 2-day window, ${Object.keys(bySection).length} sections today`
+    );
+    
+    fs.unlinkSync(tempFile);
+    console.log(`🗑️ Temp file cleaned up`);
+  } catch (e) {
+    if (fs.existsSync(tempFile)) {
+      fs.unlinkSync(tempFile);
     }
-
-    // Today-by-section
-    const d = v.start.toISOString().split('T')[0];
-    if (d === todayISO) {
-      const text = `${v.summary || ''} ${v.description || ''}`;
-      const matches = text.match(/\b[0-9A-Z]+\b/g);
-      if (matches) {
-        const seen = new Set();
-        for (const s of matches) {
-          if (seen.has(s)) continue;
-          seen.add(s);
-          if (!bySection[s]) bySection[s] = [];
-          bySection[s].push(minimal(v));
-        }
-      }
-    }
+    throw e;
   }
-
-  cachedRecent = recent;
-  recentBuiltAt = Date.now();
-  cachedByDay = { [todayISO]: bySection };
-  lastDayBuilt = todayISO;
-
-  console.log(
-    `🗓️ Parsed ${totalEvents} total events, cached ${filteredEvents} in 2-day window, ${Object.keys(bySection).length} sections today`
-  );
 }
 
 // ----- Background refresh -----
-const REFRESH_MS = 10 * 60 * 1000; // 10 minutes
+const REFRESH_MS = 10 * 60 * 1000;
 
 async function backgroundRefresh() {
   try {
-    console.log('🔄 Background refresh starting...');
-    const data = await fetchAndParseICS(ICS_URL, 2);
-    rebuildCaches(data);
+    console.log('🔄 Background refresh...');
+    await fetchAndRebuildCache();
+    cacheStatus = 'ready';
   } catch (e) {
-    console.error('❌ Background refresh failed:', e.message);
+    console.error('❌ Refresh failed:', e.message);
+    cacheStatus = 'error';
   } finally {
     setTimeout(backgroundRefresh, REFRESH_MS);
   }
@@ -169,30 +240,35 @@ async function backgroundRefresh() {
 
 // ----- Health endpoint -----
 app.get('/health', (_req, res) => {
-  if (cachedRecent.length === 0 && recentBuiltAt === 0) {
-    return res.status(503).json({ status: 'warming up' });
-  }
-  res.status(200).send('ok');
+  res.status(200).json({ 
+    status: 'ok',
+    cache: cacheStatus,
+    events: cachedRecent.length
+  });
 });
 
 // ----- API -----
 app.get('/events', async (req, res) => {
   const { section, date } = req.query;
 
+  if (cacheStatus === 'building' && cachedRecent.length === 0) {
+    return res.status(503).json({ 
+      error: 'Cache still building, retry in 30s',
+      status: cacheStatus
+    });
+  }
+
   try {
     const todayISO = new Date().toISOString().split('T')[0];
 
-    // Trigger background refresh if stale (>15 min)
     if (Date.now() - recentBuiltAt > 15 * 60 * 1000) {
       (async () => {
         try {
-          const data = await fetchAndParseICS(ICS_URL, 1);
-          rebuildCaches(data);
+          await fetchAndRebuildCache();
         } catch (_) {}
       })();
     }
 
-    // 1) Legacy: /events?section=SEC&date=YYYY-MM-DD
     if (section && date) {
       const filtered = cachedRecent.filter((e) => {
         const d = e.start && e.start.toISOString().split('T')[0];
@@ -203,13 +279,11 @@ app.get('/events', async (req, res) => {
       return res.json(filtered);
     }
 
-    // 2) Today-by-section: /events?section=SEC
     if (section) {
       const bySection = cachedByDay[todayISO] || cachedByDay[lastDayBuilt] || {};
       return res.json(bySection[section] || []);
     }
 
-    // 3) No params: return recent window (2 days)
     return res.json(cachedRecent);
   } catch (err) {
     console.error('❌ Handler error:', err.message);
@@ -218,24 +292,22 @@ app.get('/events', async (req, res) => {
 });
 
 // ----- Server Startup -----
-(async function startServer() {
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`⏳ Building cache in background...`);
+});
+
+(async function buildInitialCache() {
   try {
-    console.log('🔄 Initial calendar fetch (streaming mode for large ICS)...');
-    const data = await fetchAndParseICS(ICS_URL, 2);
-    rebuildCaches(data);
+    console.log('🔄 Initial calendar fetch...');
+    await fetchAndRebuildCache();
+    cacheStatus = 'ready';
     console.log('✅ Cache ready');
     
     setTimeout(backgroundRefresh, REFRESH_MS);
-    
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 Server running on port ${PORT} (2-day cache, 115s timeout)`);
-    });
   } catch (error) {
     console.error('❌ Initial fetch failed:', error.message);
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`⚠️ Server started without cache - will retry in 30s`);
-    });
+    cacheStatus = 'error';
     setTimeout(backgroundRefresh, 30000);
   }
 })();
-
