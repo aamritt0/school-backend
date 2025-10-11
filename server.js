@@ -1,3 +1,5 @@
+// server.js — Koyeb-friendly ICS proxy with background refresh and caching
+
 const express = require('express');
 const axios = require('axios');
 const ical = require('node-ical');
@@ -5,35 +7,38 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: '*' })); // allow all origins
 
-// ENV
+// ----- Environment -----
 const ICS_URL = process.env.ICS_URL;
 if (!ICS_URL) {
   console.error('❌ ICS_URL not set');
   process.exit(1);
 }
+const PORT = process.env.PORT || 10000;
 
-// Health endpoint for Koyeb
+// ----- Health endpoint for Koyeb -----
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Axios client with safety limits (Free tier friendly)
+// ----- Axios client (used only by background refresh) -----
 const http = axios.create({
-  timeout: 30000,                      // 30s to tolerate slow ICS hosts
-  maxContentLength: 5 * 1024 * 1024,   // 5 MB cap
+  timeout: 60000,                        // 60s for slow calendar hosts
+  maxContentLength: 5 * 1024 * 1024,     // 5 MB safety cap
   maxBodyLength: 5 * 1024 * 1024,
   responseType: 'text',
-  validateStatus: (s) => s >= 200 && s < 400, // allow simple redirects
+  validateStatus: s => s >= 200 && s < 400, // accept 2xx and simple redirects
 });
 
-// Cached parsed events (last fetch time + today breakdown)
-let cachedRecent = [];           // 7-day window list for the legacy endpoint
-let lastFetchMs = 0;
-const CACHE_MS = 5 * 60 * 1000;  // 5 minutes
+// ----- Caches -----
+// Recent window for legacy endpoint and quick fallback
+let cachedRecent = []; // array of minimal events in a +/-7 day window
+let recentBuiltAt = 0;
 
-let cachedByDay = {};            // { 'YYYY-MM-DD': { SECTION: [events] } }
-let lastDayBuilt = '';           // date stamp of cachedByDay
+// Today-by-section cache for /events?section=SEC
+let cachedByDay = {}; // { 'YYYY-MM-DD': { SECTION: [events] } }
+let lastDayBuilt = '';
 
+// ----- Helpers -----
 function minimal(e) {
   return {
     id: e.uid,
@@ -44,45 +49,44 @@ function minimal(e) {
   };
 }
 
-async function fetchICSOnce() {
-  const res = await http.get(ICS_URL);
-  // follow one redirect manually if needed
-  if (res.status >= 300 && res.status < 400 && res.headers?.location) {
-    const res2 = await http.get(res.headers.location);
-    return res2.data;
+async function fetchWithRetry(url, tries = 3) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await http.get(url);
+      if (r.status >= 300 && r.status < 400 && r.headers?.location) {
+        const r2 = await http.get(r.headers.location);
+        return r2.data;
+      }
+      return r.data;
+    } catch (e) {
+      last = e;
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i))); // 1s, 2s, 4s
+    }
   }
-  return res.data;
+  throw last;
 }
 
-// Parse and maintain both caches
-async function refreshCaches() {
-  const now = Date.now();
-  if (now - lastFetchMs < CACHE_MS && cachedRecent.length) {
-    return;
-  }
-
-  const raw = await fetchICSOnce();
+function rebuildCaches(raw) {
   const data = ical.parseICS(raw);
 
-  const today = new Date();
-  const oneWeekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const oneWeekAhead = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const now = new Date();
+  const todayISO = now.toISOString().split('T')[0];
+  const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const oneWeekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-  // Rebuild 7-day recent cache
   const recent = [];
-  // Rebuild today-by-section cache
-  const todayISO = today.toISOString().split('T')[0];
   const bySection = {};
 
   for (const v of Object.values(data)) {
     if (!v || v.type !== 'VEVENT' || !v.start) continue;
 
-    // 7-day window
+    // 7-day recent window
     if (v.start >= oneWeekAgo && v.start <= oneWeekAhead) {
       recent.push(minimal(v));
     }
 
-    // Today bucket
+    // Today-by-section
     const d = v.start.toISOString().split('T')[0];
     if (d === todayISO) {
       const text = `${v.summary || ''} ${v.description || ''}`;
@@ -100,24 +104,62 @@ async function refreshCaches() {
   }
 
   cachedRecent = recent;
-  lastFetchMs = now;
-
+  recentBuiltAt = Date.now();
   cachedByDay = { [todayISO]: bySection };
   lastDayBuilt = todayISO;
 
   console.log(
-    `🗓️ Cached ${recent.length} recent events; today sections: ${Object.keys(bySection).length}`
+    `🗓️ Built caches: recent=${recent.length} events, today sections=${Object.keys(bySection).length}`
   );
 }
 
-// Legacy shape: /events?section=SEC&date=YYYY-MM-DD
-app.get('/events', async (req, res) => {
+// ----- Background refresh loop -----
+const REFRESH_MS = 15 * 60 * 1000; // 15 minutes
+
+async function backgroundRefresh() {
   try {
-    const { section, date } = req.query;
+    const raw = await fetchWithRetry(ICS_URL, 3);
+    rebuildCaches(raw);
+  } catch (e) {
+    console.error('Background refresh failed:', e.message);
+  } finally {
+    setTimeout(backgroundRefresh, REFRESH_MS);
+  }
+}
+backgroundRefresh(); // kick off shortly after boot
 
-    await refreshCaches();
+// Also do a one-time eager build on first request if empty
+async function ensureWarm() {
+  if (cachedRecent.length === 0 || !cachedByDay[lastDayBuilt]) {
+    try {
+      const raw = await fetchWithRetry(ICS_URL, 3);
+      rebuildCaches(raw);
+    } catch (e) {
+      console.error('Initial warm failed:', e.message);
+    }
+  }
+}
 
-    // 1) Legacy: specific date provided
+// ----- API -----
+app.get('/events', async (req, res) => {
+  const { section, date } = req.query;
+
+  // Kick a non-blocking refresh attempt; do not delay response
+  const quick = (async () => {
+    try {
+      // If recent cache is older than 20 minutes, try refresh in the background
+      if (Date.now() - recentBuiltAt > 20 * 60 * 1000) {
+        const raw = await fetchWithRetry(ICS_URL, 2);
+        rebuildCaches(raw);
+      }
+    } catch (_) {}
+  })();
+
+  try {
+    await ensureWarm();
+    const todayISO = new Date().toISOString().split('T')[0];
+
+    // 1) Legacy: /events?section=SEC&date=YYYY-MM-DD
     if (section && date) {
       const filtered = cachedRecent.filter((e) => {
         const d = e.start && e.start.toISOString().split('T')[0];
@@ -130,31 +172,23 @@ app.get('/events', async (req, res) => {
 
     // 2) Today-by-section: /events?section=SEC
     if (section) {
-      const todayISO = new Date().toISOString().split('T')[0];
-      if (lastDayBuilt !== todayISO) {
-        // force rebuild of today's section index if day rolled over
-        await refreshCaches();
-      }
-      const bySection = cachedByDay[todayISO] || {};
+      // If day rolled over, rely on background refresh; serve stale until updated
+      const bySection = cachedByDay[todayISO] || cachedByDay[lastDayBuilt] || {};
       return res.json(bySection[section] || []);
     }
 
-    // 3) No params: return recent window (debug)
+    // 3) No params: return recent window for debugging
     return res.json(cachedRecent);
   } catch (err) {
-    console.error('Error fetching/parsing ICS:', err.message);
-    // do not retain possibly large caches on persistent errors
-    if (Date.now() - lastFetchMs > CACHE_MS * 2) {
-      cachedRecent = [];
-      cachedByDay = {};
-      lastDayBuilt = '';
-    }
+    console.error('Handler error:', err.message);
     return res.status(502).json({ error: 'Upstream or parse error' });
+  } finally {
+    // detatch quick refresh
+    quick.catch(() => {});
   }
 });
 
-// Server
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () =>
-  console.log(`🚀 Server running on port ${PORT}`)
-);
+// ----- Server -----
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
