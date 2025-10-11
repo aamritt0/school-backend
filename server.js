@@ -1,13 +1,16 @@
-// server.js — Koyeb-friendly ICS proxy with background refresh and caching
+// server.js — Cross-platform version (Windows + Linux/Koyeb) - CORRECTED
 
 const express = require('express');
 const axios = require('axios');
 const ical = require('node-ical');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({ origin: '*' })); // allow all origins
+app.use(cors({ origin: '*' }));
 
 // ----- Environment -----
 const ICS_URL = process.env.ICS_URL;
@@ -17,25 +20,10 @@ if (!ICS_URL) {
 }
 const PORT = process.env.PORT || 10000;
 
-// ----- Health endpoint for Koyeb -----
-app.get('/health', (_req, res) => res.status(200).send('ok'));
-
-// ----- Axios client (used only by background refresh) -----
-const http = axios.create({
-  timeout: 150000,                        // 150s for slow calendar hosts
-  maxContentLength: 5 * 1024 * 1024,     // 5 MB safety cap
-  maxBodyLength: 5 * 1024 * 1024,
-  responseType: 'text',
-  validateStatus: s => s >= 200 && s < 400, // accept 2xx and simple redirects
-});
-
 // ----- Caches -----
-// Recent window for legacy endpoint and quick fallback
-let cachedRecent = []; // array of minimal events in a +/-7 day window
+let cachedRecent = [];
 let recentBuiltAt = 0;
-
-// Today-by-section cache for /events?section=SEC
-let cachedByDay = {}; // { 'YYYY-MM-DD': { SECTION: [events] } }
+let cachedByDay = {};
 let lastDayBuilt = '';
 
 // ----- Helpers -----
@@ -49,41 +37,92 @@ function minimal(e) {
   };
 }
 
-async function fetchWithRetry(url, tries = 3) {
-  let last;
+// Stream download to temp file, then parse
+async function fetchAndParseICS(url, tries = 2) {
+  // Use os.tmpdir() for cross-platform temp directory
+  const tempFile = path.join(os.tmpdir(), `calendar-${Date.now()}.ics`);
+  
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await http.get(url);
-      if (r.status >= 300 && r.status < 400 && r.headers?.location) {
-        const r2 = await http.get(r.headers.location);
-        return r2.data;
-      }
-      return r.data;
+      console.log(`📥 Attempt ${i + 1}/${tries} - streaming calendar to temp file...`);
+      
+      // Stream download with axios - 115s timeout
+      const response = await axios({
+        method: 'GET',
+        url: url,
+        responseType: 'stream',
+        timeout: 115000,
+        maxRedirects: 5,
+      });
+
+      const writer = fs.createWriteStream(tempFile);
+      
+      let downloadedBytes = 0;
+      response.data.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+      });
+
+      // Pipe the response stream to file
+      response.data.pipe(writer);
+
+      // Wait for download to complete
+      await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+        response.data.on('error', reject);
+      });
+
+      console.log(`✅ Downloaded ${Math.round(downloadedBytes / 1024)}KB to temp file`);
+
+      // Parse from file using node-ical's async.parseFile() method
+      console.log(`📦 Parsing ICS file...`);
+      const data = await ical.async.parseFile(tempFile);
+      
+      // Delete temp file
+      fs.unlinkSync(tempFile);
+      console.log(`🗑️ Temp file deleted`);
+
+      return data;
+
     } catch (e) {
-      last = e;
-      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i))); // 1s, 2s, 4s
+      console.error(`❌ Attempt ${i + 1} failed:`, e.message);
+      
+      // Clean up temp file if exists
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+
+      if (i < tries - 1) {
+        await new Promise(r => setTimeout(r, 2000));
+      } else {
+        throw e;
+      }
     }
   }
-  throw last;
 }
 
-function rebuildCaches(raw) {
-  const data = ical.parseICS(raw);
-
+function rebuildCaches(data) {
   const now = new Date();
   const todayISO = now.toISOString().split('T')[0];
-  const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const oneWeekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  
+  // 2-day window: today and tomorrow
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const twoDaysLater = new Date(today.getTime() + 2 * 24 * 60 * 60 * 1000);
 
   const recent = [];
   const bySection = {};
+  
+  let totalEvents = 0;
+  let filteredEvents = 0;
 
   for (const v of Object.values(data)) {
     if (!v || v.type !== 'VEVENT' || !v.start) continue;
+    totalEvents++;
 
-    // 7-day recent window
-    if (v.start >= oneWeekAgo && v.start <= oneWeekAhead) {
+    // Only keep 2-day window in memory (today + tomorrow)
+    if (v.start >= today && v.start < twoDaysLater) {
       recent.push(minimal(v));
+      filteredEvents++;
     }
 
     // Today-by-section
@@ -109,55 +148,49 @@ function rebuildCaches(raw) {
   lastDayBuilt = todayISO;
 
   console.log(
-    `🗓️ Built caches: recent=${recent.length} events, today sections=${Object.keys(bySection).length}`
+    `🗓️ Parsed ${totalEvents} total events, cached ${filteredEvents} in 2-day window, ${Object.keys(bySection).length} sections today`
   );
 }
 
-// ----- Background refresh loop -----
-const REFRESH_MS = 15 * 60 * 1000; // 15 minutes
+// ----- Background refresh -----
+const REFRESH_MS = 10 * 60 * 1000; // 10 minutes
 
 async function backgroundRefresh() {
   try {
-    const raw = await fetchWithRetry(ICS_URL, 3);
-    rebuildCaches(raw);
+    console.log('🔄 Background refresh starting...');
+    const data = await fetchAndParseICS(ICS_URL, 2);
+    rebuildCaches(data);
   } catch (e) {
-    console.error('Background refresh failed:', e.message);
+    console.error('❌ Background refresh failed:', e.message);
   } finally {
     setTimeout(backgroundRefresh, REFRESH_MS);
   }
 }
-backgroundRefresh(); // kick off shortly after boot
 
-// Also do a one-time eager build on first request if empty
-async function ensureWarm() {
-  if (cachedRecent.length === 0 || !cachedByDay[lastDayBuilt]) {
-    try {
-      const raw = await fetchWithRetry(ICS_URL, 3);
-      rebuildCaches(raw);
-    } catch (e) {
-      console.error('Initial warm failed:', e.message);
-    }
+// ----- Health endpoint -----
+app.get('/health', (_req, res) => {
+  if (cachedRecent.length === 0 && recentBuiltAt === 0) {
+    return res.status(503).json({ status: 'warming up' });
   }
-}
+  res.status(200).send('ok');
+});
 
 // ----- API -----
 app.get('/events', async (req, res) => {
   const { section, date } = req.query;
 
-  // Kick a non-blocking refresh attempt; do not delay response
-  const quick = (async () => {
-    try {
-      // If recent cache is older than 20 minutes, try refresh in the background
-      if (Date.now() - recentBuiltAt > 20 * 60 * 1000) {
-        const raw = await fetchWithRetry(ICS_URL, 2);
-        rebuildCaches(raw);
-      }
-    } catch (_) {}
-  })();
-
   try {
-    await ensureWarm();
     const todayISO = new Date().toISOString().split('T')[0];
+
+    // Trigger background refresh if stale (>15 min)
+    if (Date.now() - recentBuiltAt > 15 * 60 * 1000) {
+      (async () => {
+        try {
+          const data = await fetchAndParseICS(ICS_URL, 1);
+          rebuildCaches(data);
+        } catch (_) {}
+      })();
+    }
 
     // 1) Legacy: /events?section=SEC&date=YYYY-MM-DD
     if (section && date) {
@@ -172,23 +205,36 @@ app.get('/events', async (req, res) => {
 
     // 2) Today-by-section: /events?section=SEC
     if (section) {
-      // If day rolled over, rely on background refresh; serve stale until updated
       const bySection = cachedByDay[todayISO] || cachedByDay[lastDayBuilt] || {};
       return res.json(bySection[section] || []);
     }
 
-    // 3) No params: return recent window for debugging
+    // 3) No params: return recent window (2 days)
     return res.json(cachedRecent);
   } catch (err) {
-    console.error('Handler error:', err.message);
-    return res.status(502).json({ error: 'Upstream or parse error' });
-  } finally {
-    // detatch quick refresh
-    quick.catch(() => {});
+    console.error('❌ Handler error:', err.message);
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// ----- Server -----
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// ----- Server Startup -----
+(async function startServer() {
+  try {
+    console.log('🔄 Initial calendar fetch (streaming mode for large ICS)...');
+    const data = await fetchAndParseICS(ICS_URL, 2);
+    rebuildCaches(data);
+    console.log('✅ Cache ready');
+    
+    setTimeout(backgroundRefresh, REFRESH_MS);
+    
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Server running on port ${PORT} (2-day cache, 115s timeout)`);
+    });
+  } catch (error) {
+    console.error('❌ Initial fetch failed:', error.message);
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`⚠️ Server started without cache - will retry in 30s`);
+    });
+    setTimeout(backgroundRefresh, 30000);
+  }
+})();
