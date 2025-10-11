@@ -66,7 +66,7 @@ async function fetchICS() {
 
   // Timeouts and size limits to protect memory
   const MAX_BYTES = 5 * 1024 * 1024; // 5 MB
-  const REQUEST_TIMEOUT_MS = 8000;
+  const REQUEST_TIMEOUT_MS = 100000;
 
   await new Promise((resolve, reject) => {
     const req = https.get(ICS_URL, (res) => {
