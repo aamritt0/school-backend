@@ -1,4 +1,5 @@
 // server.js — Koyeb FREE TIER with MEMORY-EFFICIENT line-by-line parsing
+process.env.TZ = 'Europe/Rome';
 
 const express = require('express');
 const axios = require('axios');
@@ -38,31 +39,33 @@ function minimal(e) {
   };
 }
 
-// Replace the parseICSDate function in server.js
+
+
 function parseICSDate(dateStr) {
   if (!dateStr) return null;
   
-  // Check if it has timezone info
-  const hasTimezone = dateStr.includes('Z') || dateStr.includes('TZID');
+  // Rimuovi TZID se presente
+  const cleanDateStr = dateStr.replace(/TZID=[^:]+:/, '').trim();
+  const isUTC = cleanDateStr.endsWith('Z');
+  const dateOnly = cleanDateStr.replace(/[TZ]/g, '');
   
-  // Remove timezone markers but keep the date string
-  const cleanDateStr = dateStr.replace(/[TZ]/g, '').split(':')[0];
+  const year = parseInt(dateOnly.substring(0, 4));
+  const month = parseInt(dateOnly.substring(4, 6)) - 1;
+  const day = parseInt(dateOnly.substring(6, 8));
+  const hour = parseInt(dateOnly.substring(8, 10)) || 0;
+  const minute = parseInt(dateOnly.substring(10, 12)) || 0;
+  const second = parseInt(dateOnly.substring(12, 14)) || 0;
   
-  // YYYYMMDD or YYYYMMDDHHMMSS
-  const year = parseInt(cleanDateStr.substring(0, 4));
-  const month = parseInt(cleanDateStr.substring(4, 6)) - 1;
-  const day = parseInt(cleanDateStr.substring(6, 8));
-  const hour = parseInt(cleanDateStr.substring(8, 10)) || 0;
-  const minute = parseInt(cleanDateStr.substring(10, 12)) || 0;
-  
-  // If it has timezone info (ends with Z), it's UTC
-  if (hasTimezone) {
-    return new Date(Date.UTC(year, month, day, hour, minute));
+  // Se termina con Z è UTC, altrimenti usa il timezone del processo
+  if (isUTC) {
+    return new Date(Date.UTC(year, month, day, hour, minute, second));
   }
   
-  // Otherwise, treat as local time (Italy timezone)
-  return new Date(year, month, day, hour, minute);
+  // Date locali interpretate con il timezone impostato (Europe/Rome)
+  return new Date(year, month, day, hour, minute, second);
 }
+
+
 
 // Memory-efficient line-by-line ICS parser
 async function parseICSFileStreaming(filePath) {
