@@ -44,7 +44,7 @@ function minimal(e) {
 function parseICSDate(dateStr) {
   if (!dateStr) return null;
   
-  // Rimuovi TZID se presente
+  // removes TZID if present
   const cleanDateStr = dateStr.replace(/TZID=[^:]+:/, '').trim();
   const isUTC = cleanDateStr.endsWith('Z');
   const dateOnly = cleanDateStr.replace(/[TZ]/g, '');
@@ -56,12 +56,12 @@ function parseICSDate(dateStr) {
   const minute = parseInt(dateOnly.substring(10, 12)) || 0;
   const second = parseInt(dateOnly.substring(12, 14)) || 0;
   
-  // Se termina con Z è UTC, altrimenti usa il timezone del processo
+  // if terminate with Z, it's UTC otherwise uses local timezone
   if (isUTC) {
     return new Date(Date.UTC(year, month, day, hour, minute, second));
   }
   
-  // Date locali interpretate con il timezone impostato (Europe/Rome)
+  // local dates now interpreted as (EUROPE/rome)
   return new Date(year, month, day, hour, minute, second);
 }
 
