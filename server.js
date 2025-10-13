@@ -38,20 +38,29 @@ function minimal(e) {
   };
 }
 
-// Parse date from ICS format (YYYYMMDDTHHMMSS or YYYYMMDD)
+// Replace the parseICSDate function in server.js
 function parseICSDate(dateStr) {
   if (!dateStr) return null;
   
-  // Remove timezone info
-  dateStr = dateStr.replace(/[TZ]/g, '').split(':')[0];
+  // Check if it has timezone info
+  const hasTimezone = dateStr.includes('Z') || dateStr.includes('TZID');
+  
+  // Remove timezone markers but keep the date string
+  const cleanDateStr = dateStr.replace(/[TZ]/g, '').split(':')[0];
   
   // YYYYMMDD or YYYYMMDDHHMMSS
-  const year = parseInt(dateStr.substring(0, 4));
-  const month = parseInt(dateStr.substring(4, 6)) - 1;
-  const day = parseInt(dateStr.substring(6, 8));
-  const hour = parseInt(dateStr.substring(8, 10)) || 0;
-  const minute = parseInt(dateStr.substring(10, 12)) || 0;
+  const year = parseInt(cleanDateStr.substring(0, 4));
+  const month = parseInt(cleanDateStr.substring(4, 6)) - 1;
+  const day = parseInt(cleanDateStr.substring(6, 8));
+  const hour = parseInt(cleanDateStr.substring(8, 10)) || 0;
+  const minute = parseInt(cleanDateStr.substring(10, 12)) || 0;
   
+  // If it has timezone info (ends with Z), it's UTC
+  if (hasTimezone) {
+    return new Date(Date.UTC(year, month, day, hour, minute));
+  }
+  
+  // Otherwise, treat as local time (Italy timezone)
   return new Date(year, month, day, hour, minute);
 }
 
