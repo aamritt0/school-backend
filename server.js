@@ -303,57 +303,6 @@ app.get('/events', async (req, res) => {
   }
 });
 
-// ----- Aggiungi middleware per parsing JSON -----
-app.use(express.json());
-
-
-// ----- POST endpoint per testing -----
-app.post('/events/test', (req, res) => {
-  try {
-    const { summary, description, start, end, section } = req.body;
-    
-    if (!summary || !start) {
-      return res.status(400).json({ 
-        error: 'summary and start are required' 
-      });
-    }
-    
-    // Crea evento di test
-    const testEvent = {
-      id: `test-${Date.now()}`,
-      summary: summary,
-      description: description || '',
-      start: new Date(start),
-      end: end ? new Date(end) : new Date(start)
-    };
-    
-    // Aggiungi alla cache recente
-    cachedRecent.push(testEvent);
-    
-    // Aggiungi anche alla cache bySection se specificato
-    if (section) {
-      const todayISO = new Date().toISOString().split('T')[0];
-      if (!cachedByDay[todayISO]) {
-        cachedByDay[todayISO] = {};
-      }
-      if (!cachedByDay[todayISO][section]) {
-        cachedByDay[todayISO][section] = [];
-      }
-      cachedByDay[todayISO][section].push(testEvent);
-    }
-    
-    console.log(`✅ Test event added: ${summary}`);
-    res.status(201).json({ 
-      message: 'Test event added', 
-      event: testEvent 
-    });
-    
-  } catch (error) {
-    console.error('❌ Error adding test event:', error.message);
-    res.status(500).json({ error: 'Failed to add test event' });
-  }
-});
-
 
 // ----- Server Startup -----
 app.listen(PORT, '0.0.0.0', () => {
