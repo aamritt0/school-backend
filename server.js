@@ -87,15 +87,25 @@ async function parseICSFileStreaming(filePath) {
   let filteredEvents = 0;
   let inEvent = false;
   let currentEvent = {};
+  let lastProperty = null;
 
   for await (const line of rl) {
+    if (inEvent && (line.startsWith(' ') || line.startsWith('\t'))) {
+      if (lastProperty && currentEvent[lastProperty]) {
+        currentEvent[lastProperty] += line.substring(1).replace(/\\n/g, '\n');
+      }
+      continue;
+    }
+
     const trimmed = line.trim();
     
     if (trimmed === 'BEGIN:VEVENT') {
       inEvent = true;
       currentEvent = {};
+      lastProperty = null;
     } else if (trimmed === 'END:VEVENT' && inEvent) {
       inEvent = false;
+      lastProperty = null;
       totalEvents++;
       
       // Only process if we have a start date
@@ -105,8 +115,8 @@ async function parseICSFileStreaming(filePath) {
         if (startDate && startDate >= today && startDate < twoDaysLater) {
           const evt = {
             id: currentEvent.uid || `event-${totalEvents}`,
-            summary: currentEvent.summary || '',
-            description: currentEvent.description || '',
+            summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
+            description: (currentEvent.description || '').replace(/\\n/g, '\n'),
             start: startDate,
             end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
           };
@@ -140,17 +150,32 @@ async function parseICSFileStreaming(filePath) {
       }
       
     } else if (inEvent) {
-      // Parse event properties
-      if (trimmed.startsWith('DTSTART')) {
-        currentEvent.start = trimmed.split(':')[1] || trimmed.split('=')[1]?.split(':')[1];
-      } else if (trimmed.startsWith('DTEND')) {
-        currentEvent.end = trimmed.split(':')[1] || trimmed.split('=')[1]?.split(':')[1];
-      } else if (trimmed.startsWith('SUMMARY:')) {
-        currentEvent.summary = trimmed.substring(8);
-      } else if (trimmed.startsWith('DESCRIPTION:')) {
-        currentEvent.description = trimmed.substring(12);
-      } else if (trimmed.startsWith('UID:')) {
-        currentEvent.uid = trimmed.substring(4);
+      const colonIndex = trimmed.indexOf(':');
+      if (colonIndex === -1) {
+          lastProperty = null;
+          continue;
+      }
+      const propertyWithParams = trimmed.substring(0, colonIndex);
+      const property = propertyWithParams.split(';')[0];
+      const value = trimmed.substring(colonIndex + 1);
+
+      if (property === 'DTSTART') {
+        currentEvent.start = value;
+        lastProperty = 'start';
+      } else if (property === 'DTEND') {
+        currentEvent.end = value;
+        lastProperty = 'end';
+      } else if (property === 'SUMMARY') {
+        currentEvent.summary = value;
+        lastProperty = 'summary';
+      } else if (property === 'DESCRIPTION') {
+        currentEvent.description = value;
+        lastProperty = 'description';
+      } else if (property === 'UID') {
+        currentEvent.uid = value;
+        lastProperty = 'uid';
+      } else {
+        lastProperty = null;
       }
     }
   }
