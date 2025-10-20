@@ -41,6 +41,15 @@ function minimal(e) {
 
 
 
+function unescapeICS(str) {
+  return str
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\')
+    .replace(/\\n/g, '\n')
+    .replace(/\\N/g, '\n');
+}
+
 function parseICSDate(dateStr) {
   if (!dateStr) return null;
   
@@ -92,7 +101,7 @@ async function parseICSFileStreaming(filePath) {
   for await (const line of rl) {
     if (inEvent && (line.startsWith(' ') || line.startsWith('\t'))) {
       if (lastProperty && currentEvent[lastProperty]) {
-        currentEvent[lastProperty] += line.substring(1).replace(/\\n/g, '\n');
+        currentEvent[lastProperty] += line.substring(1);
       }
       continue;
     }
@@ -115,8 +124,8 @@ async function parseICSFileStreaming(filePath) {
         if (startDate && startDate >= today && startDate < twoDaysLater) {
           const evt = {
             id: currentEvent.uid || `event-${totalEvents}`,
-            summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
-            description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+            summary: unescapeICS(currentEvent.summary || ''),
+            description: unescapeICS(currentEvent.description || ''),
             start: startDate,
             end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
           };
