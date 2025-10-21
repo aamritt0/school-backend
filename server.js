@@ -1,4 +1,4 @@
-// server.js — Koyeb FREE TIER with MEMORY-EFFICIENT line-by-line parsing
+// server.js — Koyeb FREE TIER with MEMORY-EFFICIENT line-by-line parsing + RECURRING EVENTS
 process.env.TZ = 'Europe/Rome';
 
 const express = require('express');
@@ -8,6 +8,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { RRuleSet, rrulestr } = require('rrule');
 require('dotenv').config();
 
 const app = express();
@@ -39,8 +40,6 @@ function minimal(e) {
   };
 }
 
-
-
 function parseICSDate(dateStr) {
   if (!dateStr) return null;
   
@@ -65,9 +64,102 @@ function parseICSDate(dateStr) {
   return new Date(year, month, day, hour, minute, second);
 }
 
+// Expand recurring events into individual instances
+function expandEvent(currentEvent, rangeStart, rangeEnd) {
+  const startDate = parseICSDate(currentEvent.start);
+  
+  if (!startDate) return [];
+  
+  // Calculate duration for recurring events
+  let duration = 0;
+  if (currentEvent.end) {
+    const endDate = parseICSDate(currentEvent.end);
+    duration = endDate - startDate;
+  }
+  
+  // If no RRULE, treat as single event
+  if (!currentEvent.rrule) {
+    if (startDate >= rangeStart && startDate < rangeEnd) {
+      return [{
+        id: currentEvent.uid || `event-${Date.now()}`,
+        summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
+        description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+        start: startDate,
+        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
+      }];
+    }
+    return [];
+  }
+  
+  // Parse RRULE and expand occurrences
+  try {
+    const rruleSet = new RRuleSet();
+    
+    // Parse RRULE with tzid: local - this tells rrule to treat times as local
+    const rruleString = `DTSTART;TZID=Europe/Rome:${currentEvent.start}\nRRULE:${currentEvent.rrule}`;
+    const rule = rrulestr(rruleString, { 
+      forceset: false,
+      tzid: 'Europe/Rome'
+    });
+    rruleSet.rrule(rule);
+    
+    // Add exception dates (EXDATE)
+    if (currentEvent.exdates) {
+      for (const exdate of currentEvent.exdates) {
+        const exd = parseICSDate(exdate);
+        if (exd) rruleSet.exdate(exd);
+      }
+    }
+    
+    // Add additional dates (RDATE)
+    if (currentEvent.rdates) {
+      for (const rdate of currentEvent.rdates) {
+        const rd = parseICSDate(rdate);
+        if (rd) rruleSet.rdate(rd);
+      }
+    }
+    
+    // Get occurrences in our date range
+    const occurrences = rruleSet.between(rangeStart, rangeEnd, true);
+    
+    // Create event instances - preserve the original time from startDate
+    const originalHour = startDate.getHours();
+    const originalMinute = startDate.getMinutes();
+    const originalSecond = startDate.getSeconds();
+    
+    return occurrences.map((occStart, index) => {
+      // Ensure we use the correct time from the original event
+      const correctStart = new Date(occStart);
+      correctStart.setHours(originalHour, originalMinute, originalSecond);
+      
+      const occEnd = new Date(correctStart.getTime() + duration);
+      return {
+        id: `${currentEvent.uid || 'recurring'}-${correctStart.getTime()}`,
+        summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
+        description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+        start: correctStart,
+        end: occEnd,
+        isRecurring: true
+      };
+    });
+    
+  } catch (error) {
+    console.error('❌ Error parsing RRULE:', error.message);
+    // Fallback: return single instance if RRULE parsing fails
+    if (startDate >= rangeStart && startDate < rangeEnd) {
+      return [{
+        id: currentEvent.uid || `event-${Date.now()}`,
+        summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
+        description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+        start: startDate,
+        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
+      }];
+    }
+    return [];
+  }
+}
 
-
-// Memory-efficient line-by-line ICS parser
+// Memory-efficient line-by-line ICS parser with recurring events support
 async function parseICSFileStreaming(filePath) {
   const fileStream = fs.createReadStream(filePath);
   const rl = readline.createInterface({
@@ -108,24 +200,16 @@ async function parseICSFileStreaming(filePath) {
       lastProperty = null;
       totalEvents++;
       
-      // Only process if we have a start date
+      // Process the event (may generate multiple instances if recurring)
       if (currentEvent.start) {
-        const startDate = parseICSDate(currentEvent.start);
+        const instances = expandEvent(currentEvent, today, twoDaysLater);
         
-        if (startDate && startDate >= today && startDate < twoDaysLater) {
-          const evt = {
-            id: currentEvent.uid || `event-${totalEvents}`,
-            summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
-            description: (currentEvent.description || '').replace(/\\n/g, '\n'),
-            start: startDate,
-            end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
-          };
-          
+        for (const evt of instances) {
           recent.push(evt);
           filteredEvents++;
           
-          // Check if it's today
-          const d = startDate.toISOString().split('T')[0];
+          // Check if it's today for section indexing
+          const d = evt.start.toISOString().split('T')[0];
           if (d === todayISO) {
             const text = `${evt.summary} ${evt.description}`;
             const matches = text.match(/\b[0-9A-Z]+\b/g);
@@ -174,6 +258,17 @@ async function parseICSFileStreaming(filePath) {
       } else if (property === 'UID') {
         currentEvent.uid = value;
         lastProperty = 'uid';
+      } else if (property === 'RRULE') {
+        currentEvent.rrule = value;
+        lastProperty = 'rrule';
+      } else if (property === 'EXDATE') {
+        if (!currentEvent.exdates) currentEvent.exdates = [];
+        currentEvent.exdates.push(value);
+        lastProperty = null;
+      } else if (property === 'RDATE') {
+        if (!currentEvent.rdates) currentEvent.rdates = [];
+        currentEvent.rdates.push(value);
+        lastProperty = null;
       } else {
         lastProperty = null;
       }
@@ -327,7 +422,6 @@ app.get('/events', async (req, res) => {
     return res.status(500).json({ error: 'Internal error' });
   }
 });
-
 
 // ----- Server Startup -----
 app.listen(PORT, '0.0.0.0', () => {
