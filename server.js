@@ -40,6 +40,15 @@ function minimal(e) {
   };
 }
 
+function unescapeICSText(text) {
+  if (!text) return '';
+  return text
+    .replace(/\\n/g, '\n')
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\');
+}
+
 function parseICSDate(dateStr) {
   if (!dateStr) return null;
   
@@ -82,8 +91,8 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
     if (startDate >= rangeStart && startDate < rangeEnd) {
       return [{
         id: currentEvent.uid || `event-${Date.now()}`,
-        summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
-        description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+        summary: unescapeICSText(currentEvent.summary || ''),
+        description: unescapeICSText(currentEvent.description || ''),
         start: startDate,
         end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
       }];
@@ -135,8 +144,8 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
       const occEnd = new Date(correctStart.getTime() + duration);
       return {
         id: `${currentEvent.uid || 'recurring'}-${correctStart.getTime()}`,
-        summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
-        description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+        summary: unescapeICSText(currentEvent.summary || ''),
+        description: unescapeICSText(currentEvent.description || ''),
         start: correctStart,
         end: occEnd,
         isRecurring: true
@@ -149,8 +158,8 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
     if (startDate >= rangeStart && startDate < rangeEnd) {
       return [{
         id: currentEvent.uid || `event-${Date.now()}`,
-        summary: (currentEvent.summary || '').replace(/\\n/g, '\n'),
-        description: (currentEvent.description || '').replace(/\\n/g, '\n'),
+        summary: unescapeICSText(currentEvent.summary || ''),
+        description: unescapeICSText(currentEvent.description || ''),
         start: startDate,
         end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
       }];
