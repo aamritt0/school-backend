@@ -60,6 +60,10 @@ function parseICSDate(dateStr) {
   const year = parseInt(dateOnly.substring(0, 4));
   const month = parseInt(dateOnly.substring(4, 6)) - 1;
   const day = parseInt(dateOnly.substring(6, 8));
+  
+  // Check if this is an all-day event (only YYYYMMDD, no time component)
+  const isAllDay = dateOnly.length === 8;
+  
   const hour = parseInt(dateOnly.substring(8, 10)) || 0;
   const minute = parseInt(dateOnly.substring(10, 12)) || 0;
   const second = parseInt(dateOnly.substring(12, 14)) || 0;
@@ -70,7 +74,14 @@ function parseICSDate(dateStr) {
   }
   
   // local dates now interpreted as (EUROPE/rome)
-  return new Date(year, month, day, hour, minute, second);
+  const date = new Date(year, month, day, hour, minute, second);
+  
+  // Mark all-day events (we'll use this later)
+  if (isAllDay) {
+    date._isAllDay = true;
+  }
+  
+  return date;
 }
 
 // Expand recurring events into individual instances
@@ -89,12 +100,14 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
   // If no RRULE, treat as single event
   if (!currentEvent.rrule) {
     if (startDate >= rangeStart && startDate < rangeEnd) {
+      const isAllDay = startDate._isAllDay;
       return [{
         id: currentEvent.uid || `event-${Date.now()}`,
         summary: unescapeICSText(currentEvent.summary || ''),
         description: unescapeICSText(currentEvent.description || ''),
         start: startDate,
-        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
+        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate,
+        isAllDay: isAllDay || false
       }];
     }
     return [];
@@ -135,6 +148,7 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
     const originalHour = startDate.getHours();
     const originalMinute = startDate.getMinutes();
     const originalSecond = startDate.getSeconds();
+    const isAllDay = startDate._isAllDay;
     
     return occurrences.map((occStart, index) => {
       // Ensure we use the correct time from the original event
@@ -148,7 +162,8 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
         description: unescapeICSText(currentEvent.description || ''),
         start: correctStart,
         end: occEnd,
-        isRecurring: true
+        isRecurring: true,
+        isAllDay: isAllDay || false
       };
     });
     
@@ -156,12 +171,14 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
     console.error('❌ Error parsing RRULE:', error.message);
     // Fallback: return single instance if RRULE parsing fails
     if (startDate >= rangeStart && startDate < rangeEnd) {
+      const isAllDay = startDate._isAllDay;
       return [{
         id: currentEvent.uid || `event-${Date.now()}`,
         summary: unescapeICSText(currentEvent.summary || ''),
         description: unescapeICSText(currentEvent.description || ''),
         start: startDate,
-        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate
+        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate,
+        isAllDay: isAllDay || false
       }];
     }
     return [];
@@ -179,7 +196,8 @@ async function parseICSFileStreaming(filePath) {
   const now = new Date();
   const todayISO = now.toISOString().split('T')[0];
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const twoDaysLater = new Date(today.getTime() + 2 * 24 * 60 * 60 * 1000);
+  // Set to end of day +2 to catch all-day events properly
+  const twoDaysLater = new Date(today.getTime() + 3 * 24 * 60 * 60 * 1000);
 
   const recent = [];
   const bySection = {};
