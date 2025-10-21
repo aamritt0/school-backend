@@ -49,11 +49,14 @@ function unescapeICSText(text) {
     .replace(/\\\\/g, '\\');
 }
 
-function parseICSDate(dateStr) {
+function parseICSDate(dateStr, isValueDate = false) {
   if (!dateStr) return null;
   
-  // removes TZID if present
-  const cleanDateStr = dateStr.replace(/TZID=[^:]+:/, '').trim();
+  // Check if this is a VALUE=DATE parameter (all-day event)
+  const hasValueDate = dateStr.includes('VALUE=DATE') || isValueDate;
+  
+  // removes TZID and VALUE=DATE if present
+  const cleanDateStr = dateStr.replace(/TZID=[^:]+:/, '').replace(/VALUE=DATE:/, '').trim();
   const isUTC = cleanDateStr.endsWith('Z');
   const dateOnly = cleanDateStr.replace(/[TZ]/g, '');
   
@@ -61,8 +64,15 @@ function parseICSDate(dateStr) {
   const month = parseInt(dateOnly.substring(4, 6)) - 1;
   const day = parseInt(dateOnly.substring(6, 8));
   
-  // Check if this is an all-day event (only YYYYMMDD, no time component)
-  const isAllDay = dateOnly.length === 8;
+  // Check if this is an all-day event (only YYYYMMDD, no time component OR has VALUE=DATE)
+  const isAllDay = dateOnly.length === 8 || hasValueDate;
+  
+  // For all-day events, create date at noon local time to avoid timezone issues
+  if (isAllDay) {
+    const date = new Date(year, month, day, 12, 0, 0);
+    date._isAllDay = true;
+    return date;
+  }
   
   const hour = parseInt(dateOnly.substring(8, 10)) || 0;
   const minute = parseInt(dateOnly.substring(10, 12)) || 0;
@@ -74,41 +84,57 @@ function parseICSDate(dateStr) {
   }
   
   // local dates now interpreted as (EUROPE/rome)
-  const date = new Date(year, month, day, hour, minute, second);
-  
-  // Mark all-day events (we'll use this later)
-  if (isAllDay) {
-    date._isAllDay = true;
-  }
-  
-  return date;
+  return new Date(year, month, day, hour, minute, second);
 }
 
 // Expand recurring events into individual instances
 function expandEvent(currentEvent, rangeStart, rangeEnd) {
-  const startDate = parseICSDate(currentEvent.start);
+  const startDate = parseICSDate(currentEvent.start, currentEvent.startIsValueDate);
   
   if (!startDate) return [];
   
   // Calculate duration for recurring events
   let duration = 0;
   if (currentEvent.end) {
-    const endDate = parseICSDate(currentEvent.end);
+    const endDate = parseICSDate(currentEvent.end, currentEvent.endIsValueDate);
     duration = endDate - startDate;
   }
   
   // If no RRULE, treat as single event
   if (!currentEvent.rrule) {
-    if (startDate >= rangeStart && startDate < rangeEnd) {
-      const isAllDay = startDate._isAllDay;
-      return [{
-        id: currentEvent.uid || `event-${Date.now()}`,
-        summary: unescapeICSText(currentEvent.summary || ''),
-        description: unescapeICSText(currentEvent.description || ''),
-        start: startDate,
-        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate,
-        isAllDay: isAllDay || false
-      }];
+    const isAllDay = startDate._isAllDay;
+    
+    // For all-day events, compare by date only (ignore time)
+    if (isAllDay) {
+      const startDateOnly = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+      const rangeStartOnly = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate());
+      const rangeEndOnly = new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), rangeEnd.getDate());
+      
+      if (startDateOnly >= rangeStartOnly && startDateOnly < rangeEndOnly) {
+        // For all-day events, return just the date string (YYYY-MM-DD)
+        const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
+        
+        return [{
+          id: currentEvent.uid || `event-${Date.now()}`,
+          summary: unescapeICSText(currentEvent.summary || ''),
+          description: unescapeICSText(currentEvent.description || ''),
+          start: dateStr,
+          end: dateStr,
+          isAllDay: true
+        }];
+      }
+    } else {
+      // Regular timed events - normal comparison
+      if (startDate >= rangeStart && startDate < rangeEnd) {
+        return [{
+          id: currentEvent.uid || `event-${Date.now()}`,
+          summary: unescapeICSText(currentEvent.summary || ''),
+          description: unescapeICSText(currentEvent.description || ''),
+          start: startDate,
+          end: currentEvent.end ? parseICSDate(currentEvent.end, currentEvent.endIsValueDate) : startDate,
+          isAllDay: false
+        }];
+      }
     }
     return [];
   }
@@ -170,15 +196,34 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
   } catch (error) {
     console.error('❌ Error parsing RRULE:', error.message);
     // Fallback: return single instance if RRULE parsing fails
-    if (startDate >= rangeStart && startDate < rangeEnd) {
-      const isAllDay = startDate._isAllDay;
+    const isAllDay = startDate._isAllDay;
+    
+    // Fallback - same all-day event logic
+    if (isAllDay) {
+      const startDateOnly = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+      const rangeStartOnly = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate());
+      const rangeEndOnly = new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), rangeEnd.getDate());
+      
+      if (startDateOnly >= rangeStartOnly && startDateOnly < rangeEndOnly) {
+        const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
+        
+        return [{
+          id: currentEvent.uid || `event-${Date.now()}`,
+          summary: unescapeICSText(currentEvent.summary || ''),
+          description: unescapeICSText(currentEvent.description || ''),
+          start: dateStr,
+          end: dateStr,
+          isAllDay: true
+        }];
+      }
+    } else if (startDate >= rangeStart && startDate < rangeEnd) {
       return [{
         id: currentEvent.uid || `event-${Date.now()}`,
         summary: unescapeICSText(currentEvent.summary || ''),
         description: unescapeICSText(currentEvent.description || ''),
         start: startDate,
         end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate,
-        isAllDay: isAllDay || false
+        isAllDay: false
       }];
     }
     return [];
@@ -236,7 +281,7 @@ async function parseICSFileStreaming(filePath) {
           filteredEvents++;
           
           // Check if it's today for section indexing
-          const d = evt.start.toISOString().split('T')[0];
+          const d = evt.isAllDay ? evt.start : evt.start.toISOString().split('T')[0];
           if (d === todayISO) {
             const text = `${evt.summary} ${evt.description}`;
             const matches = text.match(/\b[0-9A-Z]+\b/g);
@@ -269,12 +314,15 @@ async function parseICSFileStreaming(filePath) {
       const propertyWithParams = trimmed.substring(0, colonIndex);
       const property = propertyWithParams.split(';')[0];
       const value = trimmed.substring(colonIndex + 1);
+      const isValueDate = propertyWithParams.includes('VALUE=DATE');
 
       if (property === 'DTSTART') {
         currentEvent.start = value;
+        currentEvent.startIsValueDate = isValueDate;
         lastProperty = 'start';
       } else if (property === 'DTEND') {
         currentEvent.end = value;
+        currentEvent.endIsValueDate = isValueDate;
         lastProperty = 'end';
       } else if (property === 'SUMMARY') {
         currentEvent.summary = value;
@@ -430,7 +478,24 @@ app.get('/events', async (req, res) => {
 
     if (section && date) {
       const filtered = cachedRecent.filter((e) => {
-        const d = e.start && e.start.toISOString().split('T')[0];
+        // Handle both Date objects and date strings
+        let d;
+        if (e.isAllDay) {
+          // All-day events: start is already a string "YYYY-MM-DD"
+          d = e.start;
+        } else if (typeof e.start === 'string' && e.start.length === 10) {
+          // Date string without time
+          d = e.start;
+        } else if (e.start instanceof Date) {
+          // Date object
+          d = e.start.toISOString().split('T')[0];
+        } else if (typeof e.start === 'string') {
+          // ISO string with time
+          d = e.start.split('T')[0];
+        } else {
+          return false;
+        }
+        
         if (d !== date) return false;
         const text = `${e.summary} ${e.description}`;
         return text.includes(section);
@@ -445,7 +510,7 @@ app.get('/events', async (req, res) => {
 
     return res.json(cachedRecent);
   } catch (err) {
-    console.error('❌ Handler error:', err.message);
+    console.error('❌ Handler error:', err.message, err.stack);
     return res.status(500).json({ error: 'Internal error' });
   }
 });
