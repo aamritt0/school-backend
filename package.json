@@ -9,10 +9,13 @@
     "axios": "^1.12.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
+    "expo-server-sdk": "^4.0.0",
     "express": "^5.1.0",
     "firebase-admin": "^12.7.0",
+    "googleapis": "^164.1.0",
     "node-cron": "^3.0.3",
     "node-ical": "^0.21.0",
-    "rrule": "^2.8.1"
+    "rrule": "^2.8.1",
+    "web-push": "^3.6.7"
   }
 }

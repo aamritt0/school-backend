@@ -1,4 +1,4 @@
-// server.js — Koyeb FREE TIER with FCM Push Notifications
+// server.js — Koyeb FREE TIER with Expo + Web Push Notifications
 process.env.TZ = 'Europe/Rome';
 
 const express = require('express');
@@ -11,25 +11,43 @@ const os = require('os');
 const { RRuleSet, rrulestr } = require('rrule');
 const admin = require('firebase-admin');
 const cron = require('node-cron');
+const { Expo } = require('expo-server-sdk');
+const webpush = require('web-push');
 require('dotenv').config();
 
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ----- Firebase Admin Setup -----
+// ----- Firebase Admin Setup (Firestore only) -----
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: process.env.FIREBASE_DATABASE_URL
   });
-  console.log('✅ Firebase Admin initialized');
+  console.log('✅ Firebase Admin initialized (Firestore)');
 } catch (error) {
   console.error('❌ Firebase Admin initialization failed:', error.message);
 }
 
 const db = admin.firestore();
+
+// ----- Expo Push Notifications Setup -----
+const expo = new Expo();
+console.log('✅ Expo Push initialized');
+
+// ----- Web Push Setup -----
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    'mailto:' + (process.env.VAPID_EMAIL || 'admin@fermitoday.app'),
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+  console.log('✅ Web Push configured');
+} else {
+  console.warn('⚠️ Web Push not configured - missing VAPID keys');
+}
 
 // ----- Environment -----
 const ICS_URL = process.env.ICS_URL;
@@ -88,13 +106,11 @@ function parseICSDate(dateStr, isValueDate = false) {
   return new Date(year, month, day, hour, minute, second);
 }
 
-// Extract class from event
 function extractClassFromSummary(summary) {
   const classMatch = summary.match(/CLASSE\s+([A-Z0-9]+)\s/);
   return classMatch ? classMatch[1] : null;
 }
 
-// Extract professor from event
 function extractProfessorFromSummary(summary) {
   const professors = [];
   
@@ -126,7 +142,6 @@ function extractProfessorFromSummary(summary) {
   return professors;
 }
 
-// Expand recurring events
 function expandEvent(currentEvent, rangeStart, rangeEnd) {
   const startDate = parseICSDate(currentEvent.start, currentEvent.startIsValueDate);
   
@@ -254,7 +269,6 @@ function expandEvent(currentEvent, rangeStart, rangeEnd) {
   }
 }
 
-// Memory-efficient ICS parser
 async function parseICSFileStreaming(filePath) {
   const fileStream = fs.createReadStream(filePath);
   const rl = readline.createInterface({
@@ -373,7 +387,6 @@ async function parseICSFileStreaming(filePath) {
   return { recent, bySection, totalEvents, filteredEvents };
 }
 
-// Download ICS
 async function downloadICS(url, tries = 2) {
   const tempFile = path.join(os.tmpdir(), `calendar-${Date.now()}.ics`);
   
@@ -451,44 +464,301 @@ async function fetchAndRebuildCache() {
 
 // ----- Notification Functions -----
 
-async function sendFCMNotification(token, title, body, data = {}) {
+function getNotificationType(tokenOrSubscription) {
+  if (!tokenOrSubscription) return 'unknown';
+  
+  if (typeof tokenOrSubscription === 'string') {
+    if (Expo.isExpoPushToken(tokenOrSubscription)) {
+      return 'expo';
+    }
+    if (tokenOrSubscription.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(tokenOrSubscription);
+        if (parsed.endpoint) return 'webpush';
+      } catch (e) {}
+    }
+  }
+  
+  if (typeof tokenOrSubscription === 'object' && tokenOrSubscription.endpoint) {
+    return 'webpush';
+  }
+  
+  return 'unknown';
+}
+
+async function deleteToken(tokenOrSubscription) {
   try {
+    let tokenId;
+    if (typeof tokenOrSubscription === 'string') {
+      tokenId = tokenOrSubscription;
+    } else if (typeof tokenOrSubscription === 'object' && tokenOrSubscription.endpoint) {
+      tokenId = tokenOrSubscription.endpoint;
+    } else {
+      tokenId = JSON.stringify(tokenOrSubscription);
+    }
+    
+    await db.collection('tokens').doc(tokenId).delete();
+  } catch (error) {
+    console.error('Failed to delete token:', error.message);
+  }
+}
+
+async function sendExpoNotification(pushToken, title, body, data = {}) {
+  try {
+    if (!Expo.isExpoPushToken(pushToken)) {
+      console.error(`❌ Invalid Expo token: ${pushToken}`);
+      await deleteToken(pushToken);
+      return false;
+    }
+
     const message = {
-      notification: {
-        title,
-        body,
-      },
-      data,
-      token,
-      android: {
-        priority: 'high',
-        notification: {
-          channelId: 'fermitoday_updates',
-          sound: 'default',
-        }
-      },
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
-            badge: 1,
-          }
-        }
-      }
+      to: pushToken,
+      sound: 'default',
+      title: title,
+      body: body,
+      data: data,
+      priority: 'high',
+      channelId: 'fermitoday_updates',
     };
 
-    await admin.messaging().send(message);
-    console.log(`✅ Notification sent to token: ${token.substring(0, 20)}...`);
-    return true;
-  } catch (error) {
-    console.error(`❌ Failed to send notification:`, error.message);
+    const chunks = expo.chunkPushNotifications([message]);
     
-    if (error.code === 'messaging/invalid-registration-token' || 
-        error.code === 'messaging/registration-token-not-registered') {
-      console.log(`🗑️ Removing invalid token: ${token.substring(0, 20)}...`);
-      await db.collection('tokens').doc(token).delete();
+    for (const chunk of chunks) {
+      const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+      
+      for (const ticket of ticketChunk) {
+        if (ticket.status === 'error') {
+          console.error(`❌ Expo error:`, ticket.message);
+          
+          if (ticket.details?.error === 'DeviceNotRegistered') {
+            console.log(`🗑️ Removing unregistered Expo token`);
+            await deleteToken(pushToken);
+            return false;
+          }
+        } else if (ticket.status === 'ok') {
+          console.log(`✅ Expo sent: ${pushToken.substring(0, 30)}...`);
+          return true;
+        }
+      }
     }
     return false;
+  } catch (error) {
+    console.error(`❌ Expo failed:`, error.message);
+    return false;
+  }
+}
+
+async function sendWebPushNotification(subscriptionInfo, title, body, data = {}) {
+  try {
+    let subscription = subscriptionInfo;
+    
+    if (typeof subscriptionInfo === 'string') {
+      subscription = JSON.parse(subscriptionInfo);
+    }
+    
+    if (!subscription.endpoint) {
+      console.error(`❌ Invalid Web Push subscription`);
+      await deleteToken(subscriptionInfo);
+      return false;
+    }
+
+    const payload = JSON.stringify({
+      title: title,
+      body: body,
+      icon: '/icon-192x192.png',
+      badge: '/badge-72x72.png',
+      data: {
+        ...data,
+        url: '/',
+      },
+      tag: data.type || 'default',
+      requireInteraction: false,
+    });
+
+    await webpush.sendNotification(subscription, payload);
+    console.log(`✅ Web Push sent: ${subscription.endpoint.substring(0, 50)}...`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Web Push failed:`, error.message);
+    
+    if (error.statusCode === 404 || error.statusCode === 410) {
+      console.log(`🗑️ Removing expired Web Push subscription`);
+      await deleteToken(subscriptionInfo);
+    }
+    return false;
+  }
+}
+
+async function sendNotification(tokenOrSubscription, title, body, data = {}) {
+  const type = getNotificationType(tokenOrSubscription);
+  
+  switch (type) {
+    case 'expo':
+      return await sendExpoNotification(tokenOrSubscription, title, body, data);
+    case 'webpush':
+      return await sendWebPushNotification(tokenOrSubscription, title, body, data);
+    default:
+      console.error(`❌ Unknown notification type: ${JSON.stringify(tokenOrSubscription).substring(0, 50)}...`);
+      await deleteToken(tokenOrSubscription);
+      return false;
+  }
+}
+
+async function sendNotificationBatch(recipients, getTitle, getBody, getData) {
+  const results = {
+    total: recipients.length,
+    sent: 0,
+    failed: 0,
+    invalidTokens: 0,
+    byType: { expo: 0, webpush: 0, unknown: 0 }
+  };
+
+  const grouped = { expo: [], webpush: [], unknown: [] };
+
+  for (const recipient of recipients) {
+    const type = getNotificationType(recipient.token);
+    grouped[type].push(recipient);
+    results.byType[type]++;
+  }
+
+  for (const recipient of grouped.unknown) {
+    await deleteToken(recipient.token);
+    results.invalidTokens++;
+  }
+
+  if (grouped.expo.length > 0) {
+    console.log(`📤 Sending ${grouped.expo.length} Expo notifications...`);
+    
+    const expoMessages = grouped.expo.map(recipient => ({
+      to: recipient.token,
+      sound: 'default',
+      title: getTitle(recipient),
+      body: getBody(recipient),
+      data: getData(recipient),
+      priority: 'high',
+      channelId: 'fermitoday_updates',
+    }));
+
+    const chunks = expo.chunkPushNotifications(expoMessages);
+    
+    for (const chunk of chunks) {
+      try {
+        const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+        
+        for (let i = 0; i < ticketChunk.length; i++) {
+          const ticket = ticketChunk[i];
+          
+          if (ticket.status === 'ok') {
+            results.sent++;
+          } else {
+            results.failed++;
+            if (ticket.details?.error === 'DeviceNotRegistered') {
+              await deleteToken(chunk[i].to);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('❌ Expo chunk error:', error);
+        results.failed += chunk.length;
+      }
+      
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  if (grouped.webpush.length > 0) {
+    console.log(`📤 Sending ${grouped.webpush.length} Web Push notifications...`);
+    
+    for (const recipient of grouped.webpush) {
+      const success = await sendWebPushNotification(
+        recipient.token,
+        getTitle(recipient),
+        getBody(recipient),
+        getData(recipient)
+      );
+      
+      results[success ? 'sent' : 'failed']++;
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
+
+  return results;
+}
+
+async function sendDailyDigestNotifications() {
+  try {
+    console.log('📅 Sending daily digest notifications...');
+    
+    const currentHour = new Date().getHours();
+    const digestTime = `${String(currentHour).padStart(2, '0')}:00`;
+    
+    const tokensSnapshot = await db.collection('tokens')
+      .where('digestEnabled', '==', true)
+      .where('digestTime', '==', digestTime)
+      .get();
+    
+    if (tokensSnapshot.empty) {
+      console.log(`📭 No tokens for digest time ${digestTime}`);
+      return;
+    }
+
+    console.log(`📬 Found ${tokensSnapshot.size} tokens for digest time ${digestTime}`);
+
+    const todayISO = new Date().toISOString().split('T')[0];
+    const todayEvents = cachedRecent.filter(e => {
+      const d = e.isAllDay ? e.start : e.start.toISOString().split('T')[0];
+      return d === todayISO;
+    });
+
+    const recipients = [];
+
+    for (const doc of tokensSnapshot.docs) {
+      const data = doc.data();
+      const { token, section, professor } = data;
+
+      let userEvents = [];
+
+      if (section) {
+        userEvents = todayEvents.filter(e => {
+          const eventSection = extractClassFromSummary(e.summary);
+          return eventSection === section;
+        });
+      }
+
+      if (professor && userEvents.length === 0) {
+        userEvents = todayEvents.filter(e => {
+          const professors = extractProfessorFromSummary(e.summary);
+          return professors.includes(professor);
+        });
+      }
+
+      if (userEvents.length > 0) {
+        recipients.push({ token, section, professor, events: userEvents });
+      }
+    }
+
+    if (recipients.length === 0) {
+      console.log('📭 No events to send');
+      return;
+    }
+
+    const results = await sendNotificationBatch(
+      recipients,
+      () => '📋 Variazioni di oggi',
+      (r) => r.events.length === 1 
+        ? r.events[0].summary 
+        : `${r.events.length} variazioni per ${r.section || r.professor}`,
+      (r) => ({
+        type: 'digest',
+        section: r.section || '',
+        professor: r.professor || '',
+        eventCount: r.events.length.toString(),
+      })
+    );
+
+    console.log(`✅ Digest complete - Sent: ${results.sent}/${results.total}, Failed: ${results.failed}, Expo: ${results.byType.expo}, Web: ${results.byType.webpush}`);
+  } catch (error) {
+    console.error('❌ Error in digest:', error);
   }
 }
 
@@ -496,12 +766,16 @@ async function checkAndSendRealTimeNotifications() {
   try {
     console.log('🔔 Checking for new events...');
     
-    const tokensSnapshot = await db.collection('tokens').where('realtimeEnabled', '==', true).get();
+    const tokensSnapshot = await db.collection('tokens')
+      .where('realtimeEnabled', '==', true)
+      .get();
     
     if (tokensSnapshot.empty) {
       console.log('📭 No tokens with realtime enabled');
       return;
     }
+
+    console.log(`📬 Found ${tokensSnapshot.size} tokens with realtime enabled`);
 
     const todayISO = new Date().toISOString().split('T')[0];
     const todayEvents = cachedRecent.filter(e => {
@@ -535,9 +809,9 @@ async function checkAndSendRealTimeNotifications() {
       }
     }
 
-    const promises = [];
-    
-    tokensSnapshot.forEach(doc => {
+    const recipients = [];
+
+    for (const doc of tokensSnapshot.docs) {
       const data = doc.data();
       const { token, section, professor } = data;
 
@@ -554,102 +828,34 @@ async function checkAndSendRealTimeNotifications() {
       eventsToNotify = Array.from(new Map(eventsToNotify.map(e => [e.id, e])).values());
 
       if (eventsToNotify.length > 0) {
-        const title = '🔔 Nuova variazione!';
-        let body = '';
-        
-        if (eventsToNotify.length === 1) {
-          body = eventsToNotify[0].summary;
-        } else {
-          body = `${eventsToNotify.length} nuove variazioni per ${section || professor}`;
-        }
-
-        promises.push(
-          sendFCMNotification(token, title, body, {
-            type: 'realtime',
-            section: section || '',
-            professor: professor || '',
-            eventCount: eventsToNotify.length.toString(),
-          })
-        );
+        recipients.push({ token, section, professor, events: eventsToNotify });
       }
-    });
+    }
 
-    await Promise.allSettled(promises);
-
-    newEvents.forEach(e => lastSentEventIds.add(e.id));
-
-    console.log(`✅ Sent ${promises.length} real-time notifications`);
-  } catch (error) {
-    console.error('❌ Error in real-time notifications:', error);
-  }
-}
-
-async function sendDailyDigestNotifications() {
-  try {
-    console.log('📅 Sending daily digest notifications...');
-    
-    const currentHour = new Date().getHours();
-    const digestTime = `${String(currentHour).padStart(2, '0')}:00`;
-    
-    const tokensSnapshot = await db.collection('tokens')
-      .where('digestEnabled', '==', true)
-      .where('digestTime', '==', digestTime)
-      .get();
-    
-    if (tokensSnapshot.empty) {
-      console.log(`📭 No tokens for digest time ${digestTime}`);
+    if (recipients.length === 0) {
+      console.log('📭 No matching recipients');
       return;
     }
 
-    const todayISO = new Date().toISOString().split('T')[0];
-    const todayEvents = cachedRecent.filter(e => {
-      const d = e.isAllDay ? e.start : e.start.toISOString().split('T')[0];
-      return d === todayISO;
-    });
+    const results = await sendNotificationBatch(
+      recipients,
+      () => '🔔 Nuova variazione!',
+      (r) => r.events.length === 1 
+        ? r.events[0].summary 
+        : `${r.events.length} nuove variazioni per ${r.section || r.professor}`,
+      (r) => ({
+        type: 'realtime',
+        section: r.section || '',
+        professor: r.professor || '',
+        eventCount: r.events.length.toString(),
+      })
+    );
 
-    const promises = [];
-    
-    tokensSnapshot.forEach(doc => {
-      const data = doc.data();
-      const { token, section, professor } = data;
+    newEvents.forEach(e => lastSentEventIds.add(e.id));
 
-      let userEvents = [];
-
-      if (section) {
-        userEvents = todayEvents.filter(e => {
-          const eventSection = extractClassFromSummary(e.summary);
-          return eventSection === section;
-        });
-      }
-
-      if (professor && userEvents.length === 0) {
-        userEvents = todayEvents.filter(e => {
-          const professors = extractProfessorFromSummary(e.summary);
-          return professors.includes(professor);
-        });
-      }
-
-      if (userEvents.length > 0) {
-        const title = '📋 Variazioni di oggi';
-        const body = userEvents.length === 1 
-          ? userEvents[0].summary
-          : `${userEvents.length} variazioni per ${section || professor}`;
-
-        promises.push(
-          sendFCMNotification(token, title, body, {
-            type: 'digest',
-            section: section || '',
-            professor: professor || '',
-            eventCount: userEvents.length.toString(),
-          })
-        );
-      }
-    });
-
-    await Promise.allSettled(promises);
-    console.log(`✅ Sent ${promises.length} daily digest notifications`);
+    console.log(`✅ Realtime complete - Sent: ${results.sent}/${results.total}, Failed: ${results.failed}, Expo: ${results.byType.expo}, Web: ${results.byType.webpush}`);
   } catch (error) {
-    console.error('❌ Error in daily digest notifications:', error);
+    console.error('❌ Error in realtime notifications:', error);
   }
 }
 
@@ -756,14 +962,34 @@ app.get('/events', async (req, res) => {
 
 app.post('/register-token', async (req, res) => {
   try {
-    const { token, section, professor, digestEnabled, digestTime, realtimeEnabled } = req.body;
+    const { token, subscription, section, professor, digestEnabled, digestTime, realtimeEnabled } = req.body;
 
-    if (!token) {
-      return res.status(400).json({ error: 'Token is required' });
+    const notificationData = token || subscription;
+    
+    if (!notificationData) {
+      return res.status(400).json({ error: 'Token or subscription is required' });
+    }
+
+    const type = getNotificationType(notificationData);
+    
+    if (type === 'unknown') {
+      return res.status(400).json({ error: 'Invalid token or subscription format' });
+    }
+
+    let docId;
+    if (typeof notificationData === 'string') {
+      docId = notificationData;
+    } else if (notificationData.endpoint) {
+      docId = notificationData.endpoint;
+    } else {
+      docId = JSON.stringify(notificationData);
     }
 
     const tokenData = {
-      token,
+      token: typeof notificationData === 'string' 
+        ? notificationData 
+        : JSON.stringify(notificationData),
+      type: type,
       section: section || null,
       professor: professor || null,
       digestEnabled: digestEnabled !== undefined ? digestEnabled : true,
@@ -772,10 +998,10 @@ app.post('/register-token', async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    await db.collection('tokens').doc(token).set(tokenData, { merge: true });
+    await db.collection('tokens').doc(docId).set(tokenData, { merge: true });
 
-    console.log(`✅ Token registered: ${token.substring(0, 20)}...`);
-    res.json({ success: true, message: 'Token registered successfully' });
+    console.log(`✅ ${type.toUpperCase()} token registered: ${docId.substring(0, 30)}...`);
+    res.json({ success: true, message: 'Token registered successfully', type });
   } catch (error) {
     console.error('❌ Error registering token:', error);
     res.status(500).json({ error: 'Failed to register token' });
@@ -825,6 +1051,52 @@ app.post('/update-preferences', async (req, res) => {
   } catch (error) {
     console.error('❌ Error updating preferences:', error);
     res.status(500).json({ error: 'Failed to update preferences' });
+  }
+});
+
+app.get('/vapid-public-key', (req, res) => {
+  if (!process.env.VAPID_PUBLIC_KEY) {
+    return res.status(503).json({ error: 'Web Push not configured' });
+  }
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+app.get('/admin/token-stats', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    
+    if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const tokensSnapshot = await db.collection('tokens').get();
+    
+    const stats = {
+      total: tokensSnapshot.size,
+      expo: 0,
+      webpush: 0,
+      unknown: 0,
+      bySection: {},
+      byProfessor: {},
+    };
+
+    tokensSnapshot.forEach(doc => {
+      const data = doc.data();
+      const token = data.token;
+      const type = getNotificationType(token);
+      stats[type]++;
+      
+      if (data.section) {
+        stats.bySection[data.section] = (stats.bySection[data.section] || 0) + 1;
+      }
+      if (data.professor) {
+        stats.byProfessor[data.professor] = (stats.byProfessor[data.professor] || 0) + 1;
+      }
+    });
+
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
