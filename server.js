@@ -1,58 +1,60 @@
 // server.js — Koyeb FREE TIER with Expo + Web Push Notifications
-process.env.TZ = 'Europe/Rome';
+process.env.TZ = "Europe/Rome";
 
-const express = require('express');
-const axios = require('axios');
-const readline = require('readline');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { RRuleSet, rrulestr } = require('rrule');
-const admin = require('firebase-admin');
-const cron = require('node-cron');
-const { Expo } = require('expo-server-sdk');
-const webpush = require('web-push');
-require('dotenv').config();
+const express = require("express");
+const axios = require("axios");
+const readline = require("readline");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { RRuleSet, rrulestr } = require("rrule");
+const admin = require("firebase-admin");
+const cron = require("node-cron");
+const { Expo } = require("expo-server-sdk");
+const webpush = require("web-push");
+require("dotenv").config();
 
 const app = express();
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 // ----- Firebase Admin Setup (Firestore only) -----
 try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+  const serviceAccount = JSON.parse(
+    process.env.FIREBASE_SERVICE_ACCOUNT || "{}"
+  );
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.FIREBASE_DATABASE_URL
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
   });
-  console.log('✅ Firebase Admin initialized (Firestore)');
+  console.log("✅ Firebase Admin initialized (Firestore)");
 } catch (error) {
-  console.error('❌ Firebase Admin initialization failed:', error.message);
+  console.error("❌ Firebase Admin initialization failed:", error.message);
 }
 
 const db = admin.firestore();
 
 // ----- Expo Push Notifications Setup -----
 const expo = new Expo();
-console.log('✅ Expo Push initialized');
+console.log("✅ Expo Push initialized");
 
 // ----- Web Push Setup -----
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails(
-    'mailto:' + (process.env.VAPID_EMAIL || 'admin@fermitoday.app'),
+    "mailto:" + (process.env.VAPID_EMAIL || "admin@fermitoday.app"),
     process.env.VAPID_PUBLIC_KEY,
     process.env.VAPID_PRIVATE_KEY
   );
-  console.log('✅ Web Push configured');
+  console.log("✅ Web Push configured");
 } else {
-  console.warn('⚠️ Web Push not configured - missing VAPID keys');
+  console.warn("⚠️ Web Push not configured - missing VAPID keys");
 }
 
 // ----- Environment -----
 const ICS_URL = process.env.ICS_URL;
 if (!ICS_URL) {
-  console.error('❌ ICS_URL not set');
+  console.error("❌ ICS_URL not set");
   process.exit(1);
 }
 const PORT = process.env.PORT || 10000;
@@ -61,48 +63,51 @@ const PORT = process.env.PORT || 10000;
 let cachedRecent = [];
 let recentBuiltAt = 0;
 let cachedByDay = {};
-let lastDayBuilt = '';
-let cacheStatus = 'building';
+let lastDayBuilt = "";
+let cacheStatus = "building";
 let lastSentEventIds = new Set();
 
 // ----- Helper Functions -----
 function unescapeICSText(text) {
-  if (!text) return '';
+  if (!text) return "";
   return text
-    .replace(/\\n/g, '\n')
-    .replace(/\\,/g, ',')
-    .replace(/\\;/g, ';')
-    .replace(/\\\\/g, '\\');
+    .replace(/\\n/g, "\n")
+    .replace(/\\,/g, ",")
+    .replace(/\\;/g, ";")
+    .replace(/\\\\/g, "\\");
 }
 
 function parseICSDate(dateStr, isValueDate = false) {
   if (!dateStr) return null;
-  
-  const hasValueDate = dateStr.includes('VALUE=DATE') || isValueDate;
-  const cleanDateStr = dateStr.replace(/TZID=[^:]+:/, '').replace(/VALUE=DATE:/, '').trim();
-  const isUTC = cleanDateStr.endsWith('Z');
-  const dateOnly = cleanDateStr.replace(/[TZ]/g, '');
-  
+
+  const hasValueDate = dateStr.includes("VALUE=DATE") || isValueDate;
+  const cleanDateStr = dateStr
+    .replace(/TZID=[^:]+:/, "")
+    .replace(/VALUE=DATE:/, "")
+    .trim();
+  const isUTC = cleanDateStr.endsWith("Z");
+  const dateOnly = cleanDateStr.replace(/[TZ]/g, "");
+
   const year = parseInt(dateOnly.substring(0, 4));
   const month = parseInt(dateOnly.substring(4, 6)) - 1;
   const day = parseInt(dateOnly.substring(6, 8));
-  
+
   const isAllDay = dateOnly.length === 8 || hasValueDate;
-  
+
   if (isAllDay) {
     const date = new Date(year, month, day, 12, 0, 0);
     date._isAllDay = true;
     return date;
   }
-  
+
   const hour = parseInt(dateOnly.substring(8, 10)) || 0;
   const minute = parseInt(dateOnly.substring(10, 12)) || 0;
   const second = parseInt(dateOnly.substring(12, 14)) || 0;
-  
+
   if (isUTC) {
     return new Date(Date.UTC(year, month, day, hour, minute, second));
   }
-  
+
   return new Date(year, month, day, hour, minute, second);
 }
 
@@ -113,12 +118,18 @@ function extractClassFromSummary(summary) {
 
 function extractProfessorFromSummary(summary) {
   const professors = [];
-  
-  const pluralMatch = summary.match(/PROFF?\.(?:ssa)?\s*([A-Z][A-Z\s,.']+?)(?=\s*CLASSE|\s*AULA|\s*ASSENTE|\s*$)/i);
+
+  const pluralMatch = summary.match(
+    /PROFF?\.(?:ssa)?\s*([A-Z][A-Z\s,.']+?)(?=\s*CLASSE|\s*AULA|\s*ASSENTE|\s*$)/i
+  );
   if (pluralMatch) {
-    const names = pluralMatch[1].split(',');
+    const names = pluralMatch[1].split(",");
     for (const name of names) {
-      const trimmedName = name.trim().replace(/['"]+$/, '').trim().replace(/\s+/g, " ");
+      const trimmedName = name
+        .trim()
+        .replace(/['"]+$/, "")
+        .trim()
+        .replace(/\s+/g, " ");
       if (trimmedName.length > 0 && trimmedName.length < 50) {
         professors.push(trimmedName);
       }
@@ -127,9 +138,13 @@ function extractProfessorFromSummary(summary) {
       return professors;
     }
   }
-  
-  const profMatches = [...summary.matchAll(/PROF\.?(?:ssa)?\.?\s*([A-Z][A-Z\s]+?)(?=\s*[,\(\)]|\s+ASSENTE|\s+CLASSE|\s*$)/gi)];
-  
+
+  const profMatches = [
+    ...summary.matchAll(
+      /PROF\.?(?:ssa)?\.?\s*([A-Z][A-Z\s]+?)(?=\s*[,\(\)]|\s+ASSENTE|\s+CLASSE|\s*$)/gi
+    ),
+  ];
+
   for (const match of profMatches) {
     if (match[1]) {
       const profName = match[1].trim().replace(/\s+/g, " ");
@@ -138,132 +153,172 @@ function extractProfessorFromSummary(summary) {
       }
     }
   }
-  
+
   return professors;
 }
 
 function expandEvent(currentEvent, rangeStart, rangeEnd) {
-  const startDate = parseICSDate(currentEvent.start, currentEvent.startIsValueDate);
-  
+  const startDate = parseICSDate(
+    currentEvent.start,
+    currentEvent.startIsValueDate
+  );
+
   if (!startDate) return [];
-  
+
   let duration = 0;
   if (currentEvent.end) {
     const endDate = parseICSDate(currentEvent.end, currentEvent.endIsValueDate);
     duration = endDate - startDate;
   }
-  
+
   if (!currentEvent.rrule) {
     const isAllDay = startDate._isAllDay;
-    
+
     if (isAllDay) {
-      const startDateOnly = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
-      const rangeStartOnly = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate());
-      const rangeEndOnly = new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), rangeEnd.getDate());
-      
+      const startDateOnly = new Date(
+        startDate.getFullYear(),
+        startDate.getMonth(),
+        startDate.getDate()
+      );
+      const rangeStartOnly = new Date(
+        rangeStart.getFullYear(),
+        rangeStart.getMonth(),
+        rangeStart.getDate()
+      );
+      const rangeEndOnly = new Date(
+        rangeEnd.getFullYear(),
+        rangeEnd.getMonth(),
+        rangeEnd.getDate()
+      );
+
       if (startDateOnly >= rangeStartOnly && startDateOnly < rangeEndOnly) {
-        const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
-        
-        return [{
-          id: currentEvent.uid || `event-${Date.now()}`,
-          summary: unescapeICSText(currentEvent.summary || ''),
-          description: unescapeICSText(currentEvent.description || ''),
-          start: dateStr,
-          end: dateStr,
-          isAllDay: true
-        }];
+        const dateStr = `${startDate.getFullYear()}-${String(
+          startDate.getMonth() + 1
+        ).padStart(2, "0")}-${String(startDate.getDate()).padStart(2, "0")}`;
+
+        return [
+          {
+            id: currentEvent.uid || `event-${Date.now()}`,
+            summary: unescapeICSText(currentEvent.summary || ""),
+            description: unescapeICSText(currentEvent.description || ""),
+            start: dateStr,
+            end: dateStr,
+            isAllDay: true,
+          },
+        ];
       }
     } else {
       if (startDate >= rangeStart && startDate < rangeEnd) {
-        return [{
-          id: currentEvent.uid || `event-${Date.now()}`,
-          summary: unescapeICSText(currentEvent.summary || ''),
-          description: unescapeICSText(currentEvent.description || ''),
-          start: startDate,
-          end: currentEvent.end ? parseICSDate(currentEvent.end, currentEvent.endIsValueDate) : startDate,
-          isAllDay: false
-        }];
+        return [
+          {
+            id: currentEvent.uid || `event-${Date.now()}`,
+            summary: unescapeICSText(currentEvent.summary || ""),
+            description: unescapeICSText(currentEvent.description || ""),
+            start: startDate,
+            end: currentEvent.end
+              ? parseICSDate(currentEvent.end, currentEvent.endIsValueDate)
+              : startDate,
+            isAllDay: false,
+          },
+        ];
       }
     }
     return [];
   }
-  
+
   try {
     const rruleSet = new RRuleSet();
     const rruleString = `DTSTART;TZID=Europe/Rome:${currentEvent.start}\nRRULE:${currentEvent.rrule}`;
-    const rule = rrulestr(rruleString, { 
+    const rule = rrulestr(rruleString, {
       forceset: false,
-      tzid: 'Europe/Rome'
+      tzid: "Europe/Rome",
     });
     rruleSet.rrule(rule);
-    
+
     if (currentEvent.exdates) {
       for (const exdate of currentEvent.exdates) {
         const exd = parseICSDate(exdate);
         if (exd) rruleSet.exdate(exd);
       }
     }
-    
+
     if (currentEvent.rdates) {
       for (const rdate of currentEvent.rdates) {
         const rd = parseICSDate(rdate);
         if (rd) rruleSet.rdate(rd);
       }
     }
-    
+
     const occurrences = rruleSet.between(rangeStart, rangeEnd, true);
-    
+
     const originalHour = startDate.getHours();
     const originalMinute = startDate.getMinutes();
     const originalSecond = startDate.getSeconds();
     const isAllDay = startDate._isAllDay;
-    
+
     return occurrences.map((occStart) => {
       const correctStart = new Date(occStart);
       correctStart.setHours(originalHour, originalMinute, originalSecond);
-      
+
       const occEnd = new Date(correctStart.getTime() + duration);
       return {
-        id: `${currentEvent.uid || 'recurring'}-${correctStart.getTime()}`,
-        summary: unescapeICSText(currentEvent.summary || ''),
-        description: unescapeICSText(currentEvent.description || ''),
+        id: `${currentEvent.uid || "recurring"}-${correctStart.getTime()}`,
+        summary: unescapeICSText(currentEvent.summary || ""),
+        description: unescapeICSText(currentEvent.description || ""),
         start: correctStart,
         end: occEnd,
         isRecurring: true,
-        isAllDay: isAllDay || false
+        isAllDay: isAllDay || false,
       };
     });
-    
   } catch (error) {
-    console.error('❌ Error parsing RRULE:', error.message);
+    console.error("❌ Error parsing RRULE:", error.message);
     const isAllDay = startDate._isAllDay;
-    
+
     if (isAllDay) {
-      const startDateOnly = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
-      const rangeStartOnly = new Date(rangeStart.getFullYear(), rangeStart.getMonth(), rangeStart.getDate());
-      const rangeEndOnly = new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), rangeEnd.getDate());
-      
+      const startDateOnly = new Date(
+        startDate.getFullYear(),
+        startDate.getMonth(),
+        startDate.getDate()
+      );
+      const rangeStartOnly = new Date(
+        rangeStart.getFullYear(),
+        rangeStart.getMonth(),
+        rangeStart.getDate()
+      );
+      const rangeEndOnly = new Date(
+        rangeEnd.getFullYear(),
+        rangeEnd.getMonth(),
+        rangeEnd.getDate()
+      );
+
       if (startDateOnly >= rangeStartOnly && startDateOnly < rangeEndOnly) {
-        const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
-        
-        return [{
-          id: currentEvent.uid || `event-${Date.now()}`,
-          summary: unescapeICSText(currentEvent.summary || ''),
-          description: unescapeICSText(currentEvent.description || ''),
-          start: dateStr,
-          end: dateStr,
-          isAllDay: true
-        }];
+        const dateStr = `${startDate.getFullYear()}-${String(
+          startDate.getMonth() + 1
+        ).padStart(2, "0")}-${String(startDate.getDate()).padStart(2, "0")}`;
+
+        return [
+          {
+            id: currentEvent.uid || `event-${Date.now()}`,
+            summary: unescapeICSText(currentEvent.summary || ""),
+            description: unescapeICSText(currentEvent.description || ""),
+            start: dateStr,
+            end: dateStr,
+            isAllDay: true,
+          },
+        ];
       }
     } else if (startDate >= rangeStart && startDate < rangeEnd) {
-      return [{
-        id: currentEvent.uid || `event-${Date.now()}`,
-        summary: unescapeICSText(currentEvent.summary || ''),
-        description: unescapeICSText(currentEvent.description || ''),
-        start: startDate,
-        end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate,
-        isAllDay: false
-      }];
+      return [
+        {
+          id: currentEvent.uid || `event-${Date.now()}`,
+          summary: unescapeICSText(currentEvent.summary || ""),
+          description: unescapeICSText(currentEvent.description || ""),
+          start: startDate,
+          end: currentEvent.end ? parseICSDate(currentEvent.end) : startDate,
+          isAllDay: false,
+        },
+      ];
     }
     return [];
   }
@@ -273,17 +328,17 @@ async function parseICSFileStreaming(filePath) {
   const fileStream = fs.createReadStream(filePath);
   const rl = readline.createInterface({
     input: fileStream,
-    crlfDelay: Infinity
+    crlfDelay: Infinity,
   });
 
   const now = new Date();
-  const todayISO = now.toISOString().split('T')[0];
+  const todayISO = now.toISOString().split("T")[0];
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const twoDaysLater = new Date(today.getTime() + 3 * 24 * 60 * 60 * 1000);
 
   const recent = [];
   const bySection = {};
-  
+
   let totalEvents = 0;
   let filteredEvents = 0;
   let inEvent = false;
@@ -291,32 +346,34 @@ async function parseICSFileStreaming(filePath) {
   let lastProperty = null;
 
   for await (const line of rl) {
-    if (inEvent && (line.startsWith(' ') || line.startsWith('\t'))) {
+    if (inEvent && (line.startsWith(" ") || line.startsWith("\t"))) {
       if (lastProperty && currentEvent[lastProperty]) {
-        currentEvent[lastProperty] += line.substring(1).replace(/\\n/g, '\n');
+        currentEvent[lastProperty] += line.substring(1).replace(/\\n/g, "\n");
       }
       continue;
     }
 
     const trimmed = line.trim();
-    
-    if (trimmed === 'BEGIN:VEVENT') {
+
+    if (trimmed === "BEGIN:VEVENT") {
       inEvent = true;
       currentEvent = {};
       lastProperty = null;
-    } else if (trimmed === 'END:VEVENT' && inEvent) {
+    } else if (trimmed === "END:VEVENT" && inEvent) {
       inEvent = false;
       lastProperty = null;
       totalEvents++;
-      
+
       if (currentEvent.start) {
         const instances = expandEvent(currentEvent, today, twoDaysLater);
-        
+
         for (const evt of instances) {
           recent.push(evt);
           filteredEvents++;
-          
-          const d = evt.isAllDay ? evt.start : evt.start.toISOString().split('T')[0];
+
+          const d = evt.isAllDay
+            ? evt.start
+            : evt.start.toISOString().split("T")[0];
           if (d === todayISO) {
             const text = `${evt.summary} ${evt.description}`;
             const matches = text.match(/\b[0-9A-Z]+\b/g);
@@ -332,49 +389,48 @@ async function parseICSFileStreaming(filePath) {
           }
         }
       }
-      
+
       currentEvent = {};
-      
+
       if (totalEvents % 1000 === 0) {
         console.log(`📊 Processed ${totalEvents} events...`);
       }
-      
     } else if (inEvent) {
-      const colonIndex = trimmed.indexOf(':');
+      const colonIndex = trimmed.indexOf(":");
       if (colonIndex === -1) {
-          lastProperty = null;
-          continue;
+        lastProperty = null;
+        continue;
       }
       const propertyWithParams = trimmed.substring(0, colonIndex);
-      const property = propertyWithParams.split(';')[0];
+      const property = propertyWithParams.split(";")[0];
       const value = trimmed.substring(colonIndex + 1);
-      const isValueDate = propertyWithParams.includes('VALUE=DATE');
+      const isValueDate = propertyWithParams.includes("VALUE=DATE");
 
-      if (property === 'DTSTART') {
+      if (property === "DTSTART") {
         currentEvent.start = value;
         currentEvent.startIsValueDate = isValueDate;
-        lastProperty = 'start';
-      } else if (property === 'DTEND') {
+        lastProperty = "start";
+      } else if (property === "DTEND") {
         currentEvent.end = value;
         currentEvent.endIsValueDate = isValueDate;
-        lastProperty = 'end';
-      } else if (property === 'SUMMARY') {
+        lastProperty = "end";
+      } else if (property === "SUMMARY") {
         currentEvent.summary = value;
-        lastProperty = 'summary';
-      } else if (property === 'DESCRIPTION') {
+        lastProperty = "summary";
+      } else if (property === "DESCRIPTION") {
         currentEvent.description = value;
-        lastProperty = 'description';
-      } else if (property === 'UID') {
+        lastProperty = "description";
+      } else if (property === "UID") {
         currentEvent.uid = value;
-        lastProperty = 'uid';
-      } else if (property === 'RRULE') {
+        lastProperty = "uid";
+      } else if (property === "RRULE") {
         currentEvent.rrule = value;
-        lastProperty = 'rrule';
-      } else if (property === 'EXDATE') {
+        lastProperty = "rrule";
+      } else if (property === "EXDATE") {
         if (!currentEvent.exdates) currentEvent.exdates = [];
         currentEvent.exdates.push(value);
         lastProperty = null;
-      } else if (property === 'RDATE') {
+      } else if (property === "RDATE") {
         if (!currentEvent.rdates) currentEvent.rdates = [];
         currentEvent.rdates.push(value);
         lastProperty = null;
@@ -389,46 +445,45 @@ async function parseICSFileStreaming(filePath) {
 
 async function downloadICS(url, tries = 2) {
   const tempFile = path.join(os.tmpdir(), `calendar-${Date.now()}.ics`);
-  
+
   for (let i = 0; i < tries; i++) {
     try {
       console.log(`📥 Attempt ${i + 1}/${tries} - downloading...`);
-      
+
       const response = await axios({
-        method: 'GET',
+        method: "GET",
         url: url,
-        responseType: 'stream',
+        responseType: "stream",
         timeout: 115000,
         maxRedirects: 5,
       });
 
       const writer = fs.createWriteStream(tempFile);
-      
+
       let downloadedBytes = 0;
-      response.data.on('data', (chunk) => {
+      response.data.on("data", (chunk) => {
         downloadedBytes += chunk.length;
       });
 
       response.data.pipe(writer);
 
       await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-        response.data.on('error', reject);
+        writer.on("finish", resolve);
+        writer.on("error", reject);
+        response.data.on("error", reject);
       });
 
       console.log(`✅ Downloaded ${Math.round(downloadedBytes / 1024)}KB`);
       return tempFile;
-
     } catch (e) {
       console.error(`❌ Attempt ${i + 1} failed:`, e.message);
-      
+
       if (fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);
       }
 
       if (i < tries - 1) {
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 2000));
       } else {
         throw e;
       }
@@ -438,20 +493,23 @@ async function downloadICS(url, tries = 2) {
 
 async function fetchAndRebuildCache() {
   const tempFile = await downloadICS(ICS_URL, 2);
-  
+
   try {
     console.log(`📦 Parsing line-by-line (memory-efficient)...`);
-    const { recent, bySection, totalEvents, filteredEvents } = await parseICSFileStreaming(tempFile);
-    
+    const { recent, bySection, totalEvents, filteredEvents } =
+      await parseICSFileStreaming(tempFile);
+
     cachedRecent = recent;
     recentBuiltAt = Date.now();
-    cachedByDay = { [new Date().toISOString().split('T')[0]]: bySection };
-    lastDayBuilt = new Date().toISOString().split('T')[0];
-    
+    cachedByDay = { [new Date().toISOString().split("T")[0]]: bySection };
+    lastDayBuilt = new Date().toISOString().split("T")[0];
+
     console.log(
-      `🗓️ Parsed ${totalEvents} total, cached ${filteredEvents} in 2-day window, ${Object.keys(bySection).length} sections today`
+      `🗓️ Parsed ${totalEvents} total, cached ${filteredEvents} in 2-day window, ${
+        Object.keys(bySection).length
+      } sections today`
     );
-    
+
     fs.unlinkSync(tempFile);
     console.log(`🗑️ Temp file cleaned up`);
   } catch (e) {
@@ -465,41 +523,44 @@ async function fetchAndRebuildCache() {
 // ----- Notification Functions -----
 
 function getNotificationType(tokenOrSubscription) {
-  if (!tokenOrSubscription) return 'unknown';
-  
-  if (typeof tokenOrSubscription === 'string') {
+  if (!tokenOrSubscription) return "unknown";
+
+  if (typeof tokenOrSubscription === "string") {
     if (Expo.isExpoPushToken(tokenOrSubscription)) {
-      return 'expo';
+      return "expo";
     }
-    if (tokenOrSubscription.startsWith('{')) {
+    if (tokenOrSubscription.startsWith("{")) {
       try {
         const parsed = JSON.parse(tokenOrSubscription);
-        if (parsed.endpoint) return 'webpush';
+        if (parsed.endpoint) return "webpush";
       } catch (e) {}
     }
   }
-  
-  if (typeof tokenOrSubscription === 'object' && tokenOrSubscription.endpoint) {
-    return 'webpush';
+
+  if (typeof tokenOrSubscription === "object" && tokenOrSubscription.endpoint) {
+    return "webpush";
   }
-  
-  return 'unknown';
+
+  return "unknown";
 }
 
 async function deleteToken(tokenOrSubscription) {
   try {
     let tokenId;
-    if (typeof tokenOrSubscription === 'string') {
+    if (typeof tokenOrSubscription === "string") {
       tokenId = tokenOrSubscription;
-    } else if (typeof tokenOrSubscription === 'object' && tokenOrSubscription.endpoint) {
+    } else if (
+      typeof tokenOrSubscription === "object" &&
+      tokenOrSubscription.endpoint
+    ) {
       tokenId = tokenOrSubscription.endpoint;
     } else {
       tokenId = JSON.stringify(tokenOrSubscription);
     }
-    
-    await db.collection('tokens').doc(tokenId).delete();
+
+    await db.collection("tokens").doc(tokenId).delete();
   } catch (error) {
-    console.error('Failed to delete token:', error.message);
+    console.error("Failed to delete token:", error.message);
   }
 }
 
@@ -513,29 +574,29 @@ async function sendExpoNotification(pushToken, title, body, data = {}) {
 
     const message = {
       to: pushToken,
-      sound: 'default',
+      sound: "default",
       title: title,
       body: body,
       data: data,
-      priority: 'high',
-      channelId: 'fermitoday_updates',
+      priority: "high",
+      channelId: "fermitoday_updates",
     };
 
     const chunks = expo.chunkPushNotifications([message]);
-    
+
     for (const chunk of chunks) {
       const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
-      
+
       for (const ticket of ticketChunk) {
-        if (ticket.status === 'error') {
+        if (ticket.status === "error") {
           console.error(`❌ Expo error:`, ticket.message);
-          
-          if (ticket.details?.error === 'DeviceNotRegistered') {
+
+          if (ticket.details?.error === "DeviceNotRegistered") {
             console.log(`🗑️ Removing unregistered Expo token`);
             await deleteToken(pushToken);
             return false;
           }
-        } else if (ticket.status === 'ok') {
+        } else if (ticket.status === "ok") {
           console.log(`✅ Expo sent: ${pushToken.substring(0, 30)}...`);
           return true;
         }
@@ -548,14 +609,19 @@ async function sendExpoNotification(pushToken, title, body, data = {}) {
   }
 }
 
-async function sendWebPushNotification(subscriptionInfo, title, body, data = {}) {
+async function sendWebPushNotification(
+  subscriptionInfo,
+  title,
+  body,
+  data = {}
+) {
   try {
     let subscription = subscriptionInfo;
-    
-    if (typeof subscriptionInfo === 'string') {
+
+    if (typeof subscriptionInfo === "string") {
       subscription = JSON.parse(subscriptionInfo);
     }
-    
+
     if (!subscription.endpoint) {
       console.error(`❌ Invalid Web Push subscription`);
       await deleteToken(subscriptionInfo);
@@ -565,22 +631,24 @@ async function sendWebPushNotification(subscriptionInfo, title, body, data = {})
     const payload = JSON.stringify({
       title: title,
       body: body,
-      icon: '/icon-192x192.png',
-      badge: '/badge-72x72.png',
+      icon: "/icon-192x192.png",
+      badge: "/badge-72x72.png",
       data: {
         ...data,
-        url: '/',
+        url: "/",
       },
-      tag: data.type || 'default',
+      tag: data.type || "default",
       requireInteraction: false,
     });
 
     await webpush.sendNotification(subscription, payload);
-    console.log(`✅ Web Push sent: ${subscription.endpoint.substring(0, 50)}...`);
+    console.log(
+      `✅ Web Push sent: ${subscription.endpoint.substring(0, 50)}...`
+    );
     return true;
   } catch (error) {
     console.error(`❌ Web Push failed:`, error.message);
-    
+
     if (error.statusCode === 404 || error.statusCode === 410) {
       console.log(`🗑️ Removing expired Web Push subscription`);
       await deleteToken(subscriptionInfo);
@@ -591,14 +659,23 @@ async function sendWebPushNotification(subscriptionInfo, title, body, data = {})
 
 async function sendNotification(tokenOrSubscription, title, body, data = {}) {
   const type = getNotificationType(tokenOrSubscription);
-  
+
   switch (type) {
-    case 'expo':
+    case "expo":
       return await sendExpoNotification(tokenOrSubscription, title, body, data);
-    case 'webpush':
-      return await sendWebPushNotification(tokenOrSubscription, title, body, data);
+    case "webpush":
+      return await sendWebPushNotification(
+        tokenOrSubscription,
+        title,
+        body,
+        data
+      );
     default:
-      console.error(`❌ Unknown notification type: ${JSON.stringify(tokenOrSubscription).substring(0, 50)}...`);
+      console.error(
+        `❌ Unknown notification type: ${JSON.stringify(
+          tokenOrSubscription
+        ).substring(0, 50)}...`
+      );
       await deleteToken(tokenOrSubscription);
       return false;
   }
@@ -610,7 +687,7 @@ async function sendNotificationBatch(recipients, getTitle, getBody, getData) {
     sent: 0,
     failed: 0,
     invalidTokens: 0,
-    byType: { expo: 0, webpush: 0, unknown: 0 }
+    byType: { expo: 0, webpush: 0, unknown: 0 },
   };
 
   const grouped = { expo: [], webpush: [], unknown: [] };
@@ -628,47 +705,49 @@ async function sendNotificationBatch(recipients, getTitle, getBody, getData) {
 
   if (grouped.expo.length > 0) {
     console.log(`📤 Sending ${grouped.expo.length} Expo notifications...`);
-    
-    const expoMessages = grouped.expo.map(recipient => ({
+
+    const expoMessages = grouped.expo.map((recipient) => ({
       to: recipient.token,
-      sound: 'default',
+      sound: "default",
       title: getTitle(recipient),
       body: getBody(recipient),
       data: getData(recipient),
-      priority: 'high',
-      channelId: 'fermitoday_updates',
+      priority: "high",
+      channelId: "fermitoday_updates",
     }));
 
     const chunks = expo.chunkPushNotifications(expoMessages);
-    
+
     for (const chunk of chunks) {
       try {
         const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
-        
+
         for (let i = 0; i < ticketChunk.length; i++) {
           const ticket = ticketChunk[i];
-          
-          if (ticket.status === 'ok') {
+
+          if (ticket.status === "ok") {
             results.sent++;
           } else {
             results.failed++;
-            if (ticket.details?.error === 'DeviceNotRegistered') {
+            if (ticket.details?.error === "DeviceNotRegistered") {
               await deleteToken(chunk[i].to);
             }
           }
         }
       } catch (error) {
-        console.error('❌ Expo chunk error:', error);
+        console.error("❌ Expo chunk error:", error);
         results.failed += chunk.length;
       }
-      
-      await new Promise(r => setTimeout(r, 100));
+
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
 
   if (grouped.webpush.length > 0) {
-    console.log(`📤 Sending ${grouped.webpush.length} Web Push notifications...`);
-    
+    console.log(
+      `📤 Sending ${grouped.webpush.length} Web Push notifications...`
+    );
+
     for (const recipient of grouped.webpush) {
       const success = await sendWebPushNotification(
         recipient.token,
@@ -676,9 +755,9 @@ async function sendNotificationBatch(recipients, getTitle, getBody, getData) {
         getBody(recipient),
         getData(recipient)
       );
-      
-      results[success ? 'sent' : 'failed']++;
-      await new Promise(r => setTimeout(r, 50));
+
+      results[success ? "sent" : "failed"]++;
+      await new Promise((r) => setTimeout(r, 50));
     }
   }
 
@@ -687,26 +766,29 @@ async function sendNotificationBatch(recipients, getTitle, getBody, getData) {
 
 async function sendDailyDigestNotifications() {
   try {
-    console.log('📅 Sending daily digest notifications...');
-    
+    console.log("📅 Sending daily digest notifications...");
+
     const currentHour = new Date().getHours();
-    const digestTime = `${String(currentHour).padStart(2, '0')}:00`;
-    
-    const tokensSnapshot = await db.collection('tokens')
-      .where('digestEnabled', '==', true)
-      .where('digestTime', '==', digestTime)
+    const digestTime = `${String(currentHour).padStart(2, "0")}:00`;
+
+    const tokensSnapshot = await db
+      .collection("tokens")
+      .where("digestEnabled", "==", true)
+      .where("digestTime", "==", digestTime)
       .get();
-    
+
     if (tokensSnapshot.empty) {
       console.log(`📭 No tokens for digest time ${digestTime}`);
       return;
     }
 
-    console.log(`📬 Found ${tokensSnapshot.size} tokens for digest time ${digestTime}`);
+    console.log(
+      `📬 Found ${tokensSnapshot.size} tokens for digest time ${digestTime}`
+    );
 
-    const todayISO = new Date().toISOString().split('T')[0];
-    const todayEvents = cachedRecent.filter(e => {
-      const d = e.isAllDay ? e.start : e.start.toISOString().split('T')[0];
+    const todayISO = new Date().toISOString().split("T")[0];
+    const todayEvents = cachedRecent.filter((e) => {
+      const d = e.isAllDay ? e.start : e.start.toISOString().split("T")[0];
       return d === todayISO;
     });
 
@@ -719,16 +801,23 @@ async function sendDailyDigestNotifications() {
       let userEvents = [];
 
       if (section) {
-        userEvents = todayEvents.filter(e => {
+        const normalizedSection = section.toUpperCase().trim();
+        userEvents = todayEvents.filter((e) => {
           const eventSection = extractClassFromSummary(e.summary);
-          return eventSection === section;
+          return (
+            eventSection &&
+            eventSection.toUpperCase().trim() === normalizedSection
+          );
         });
       }
 
       if (professor && userEvents.length === 0) {
-        userEvents = todayEvents.filter(e => {
+        const normalizedProfessor = professor.toUpperCase().trim();
+        userEvents = todayEvents.filter((e) => {
           const professors = extractProfessorFromSummary(e.summary);
-          return professors.includes(professor);
+          return professors.some(
+            (p) => p.toUpperCase().trim() === normalizedProfessor
+          );
         });
       }
 
@@ -738,55 +827,59 @@ async function sendDailyDigestNotifications() {
     }
 
     if (recipients.length === 0) {
-      console.log('📭 No events to send');
+      console.log("📭 No events to send");
       return;
     }
 
     const results = await sendNotificationBatch(
       recipients,
-      () => '📋 Variazioni di oggi',
-      (r) => r.events.length === 1 
-        ? r.events[0].summary 
-        : `${r.events.length} variazioni per ${r.section || r.professor}`,
+      () => "📋 Variazioni di oggi",
+      (r) =>
+        r.events.length === 1
+          ? r.events[0].summary
+          : `${r.events.length} variazioni per ${r.section || r.professor}`,
       (r) => ({
-        type: 'digest',
-        section: r.section || '',
-        professor: r.professor || '',
+        type: "digest",
+        section: r.section || "",
+        professor: r.professor || "",
         eventCount: r.events.length.toString(),
       })
     );
 
-    console.log(`✅ Digest complete - Sent: ${results.sent}/${results.total}, Failed: ${results.failed}, Expo: ${results.byType.expo}, Web: ${results.byType.webpush}`);
+    console.log(
+      `✅ Digest complete - Sent: ${results.sent}/${results.total}, Failed: ${results.failed}, Expo: ${results.byType.expo}, Web: ${results.byType.webpush}`
+    );
   } catch (error) {
-    console.error('❌ Error in digest:', error);
+    console.error("❌ Error in digest:", error);
   }
 }
 
 async function checkAndSendRealTimeNotifications() {
   try {
-    console.log('🔔 Checking for new events...');
-    
-    const tokensSnapshot = await db.collection('tokens')
-      .where('realtimeEnabled', '==', true)
+    console.log("🔔 Checking for new events...");
+
+    const tokensSnapshot = await db
+      .collection("tokens")
+      .where("realtimeEnabled", "==", true)
       .get();
-    
+
     if (tokensSnapshot.empty) {
-      console.log('📭 No tokens with realtime enabled');
+      console.log("📭 No tokens with realtime enabled");
       return;
     }
 
     console.log(`📬 Found ${tokensSnapshot.size} tokens with realtime enabled`);
 
-    const todayISO = new Date().toISOString().split('T')[0];
-    const todayEvents = cachedRecent.filter(e => {
-      const d = e.isAllDay ? e.start : e.start.toISOString().split('T')[0];
+    const todayISO = new Date().toISOString().split("T")[0];
+    const todayEvents = cachedRecent.filter((e) => {
+      const d = e.isAllDay ? e.start : e.start.toISOString().split("T")[0];
       return d === todayISO;
     });
 
-    const newEvents = todayEvents.filter(e => !lastSentEventIds.has(e.id));
-    
+    const newEvents = todayEvents.filter((e) => !lastSentEventIds.has(e.id));
+
     if (newEvents.length === 0) {
-      console.log('✅ No new events to notify');
+      console.log("✅ No new events to notify");
       return;
     }
 
@@ -798,14 +891,18 @@ async function checkAndSendRealTimeNotifications() {
     for (const event of newEvents) {
       const section = extractClassFromSummary(event.summary);
       if (section) {
-        if (!eventsBySection[section]) eventsBySection[section] = [];
-        eventsBySection[section].push(event);
+        const normalizedSection = section.toUpperCase().trim();
+        if (!eventsBySection[normalizedSection])
+          eventsBySection[normalizedSection] = [];
+        eventsBySection[normalizedSection].push(event);
       }
 
       const professors = extractProfessorFromSummary(event.summary);
       for (const prof of professors) {
-        if (!eventsByProfessor[prof]) eventsByProfessor[prof] = [];
-        eventsByProfessor[prof].push(event);
+        const normalizedProf = prof.toUpperCase().trim();
+        if (!eventsByProfessor[normalizedProf])
+          eventsByProfessor[normalizedProf] = [];
+        eventsByProfessor[normalizedProf].push(event);
       }
     }
 
@@ -817,15 +914,27 @@ async function checkAndSendRealTimeNotifications() {
 
       let eventsToNotify = [];
 
-      if (section && eventsBySection[section]) {
-        eventsToNotify = eventsToNotify.concat(eventsBySection[section]);
+      if (section) {
+        const normalizedSection = section.toUpperCase().trim();
+        if (eventsBySection[normalizedSection]) {
+          eventsToNotify = eventsToNotify.concat(
+            eventsBySection[normalizedSection]
+          );
+        }
       }
 
-      if (professor && eventsByProfessor[professor]) {
-        eventsToNotify = eventsToNotify.concat(eventsByProfessor[professor]);
+      if (professor) {
+        const normalizedProfessor = professor.toUpperCase().trim();
+        if (eventsByProfessor[normalizedProfessor]) {
+          eventsToNotify = eventsToNotify.concat(
+            eventsByProfessor[normalizedProfessor]
+          );
+        }
       }
 
-      eventsToNotify = Array.from(new Map(eventsToNotify.map(e => [e.id, e])).values());
+      eventsToNotify = Array.from(
+        new Map(eventsToNotify.map((e) => [e.id, e])).values()
+      );
 
       if (eventsToNotify.length > 0) {
         recipients.push({ token, section, professor, events: eventsToNotify });
@@ -833,29 +942,42 @@ async function checkAndSendRealTimeNotifications() {
     }
 
     if (recipients.length === 0) {
-      console.log('📭 No matching recipients');
+      console.log("📭 No matching recipients");
       return;
     }
 
     const results = await sendNotificationBatch(
       recipients,
-      () => '🔔 Nuova variazione!',
-      (r) => r.events.length === 1 
-        ? r.events[0].summary 
-        : `${r.events.length} nuove variazioni per ${r.section || r.professor}`,
+      () => "🔔 Nuova variazione!",
+      (r) =>
+        r.events.length === 1
+          ? r.events[0].summary
+          : `${r.events.length} nuove variazioni per ${
+              r.section || r.professor
+            }`,
       (r) => ({
-        type: 'realtime',
-        section: r.section || '',
-        professor: r.professor || '',
+        type: "realtime",
+        section: r.section || "",
+        professor: r.professor || "",
         eventCount: r.events.length.toString(),
       })
     );
 
-    newEvents.forEach(e => lastSentEventIds.add(e.id));
+    newEvents.forEach((e) => lastSentEventIds.add(e.id));
 
-    console.log(`✅ Realtime complete - Sent: ${results.sent}/${results.total}, Failed: ${results.failed}, Expo: ${results.byType.expo}, Web: ${results.byType.webpush}`);
+    if (lastSentEventIds.size > 1000) {
+      const idsArray = Array.from(lastSentEventIds);
+      const toKeep = idsArray.slice(-1000);
+      lastSentEventIds.clear();
+      toKeep.forEach((id) => lastSentEventIds.add(id));
+      console.log("🧹 Cleaned up old event IDs, kept 1000 most recent");
+    }
+
+    console.log(
+      `✅ Realtime complete - Sent: ${results.sent}/${results.total}, Failed: ${results.failed}, Expo: ${results.byType.expo}, Web: ${results.byType.webpush}`
+    );
   } catch (error) {
-    console.error('❌ Error in realtime notifications:', error);
+    console.error("❌ Error in realtime notifications:", error);
   }
 }
 
@@ -864,59 +986,59 @@ const REFRESH_MS = 10 * 60 * 1000;
 
 async function backgroundRefresh() {
   try {
-    console.log('🔄 Background refresh...');
+    console.log("🔄 Background refresh...");
     await fetchAndRebuildCache();
-    cacheStatus = 'ready';
+    cacheStatus = "ready";
   } catch (e) {
-    console.error('❌ Refresh failed:', e.message);
-    cacheStatus = 'error';
+    console.error("❌ Refresh failed:", e.message);
+    cacheStatus = "error";
   } finally {
     setTimeout(backgroundRefresh, REFRESH_MS);
   }
 }
 
 // ----- Cron Jobs -----
-cron.schedule('*/10 * * * *', async () => {
-  console.log('⏰ Running real-time notification check...');
+cron.schedule("*/10 * * * *", async () => {
+  console.log("⏰ Running real-time notification check...");
   await checkAndSendRealTimeNotifications();
 });
 
-cron.schedule('0 6 * * *', async () => {
-  console.log('⏰ Running daily digest at 6:00 AM...');
+cron.schedule("0 6 * * *", async () => {
+  console.log("⏰ Running daily digest at 6:00 AM...");
   await sendDailyDigestNotifications();
 });
 
-cron.schedule('0 7 * * *', async () => {
-  console.log('⏰ Running daily digest at 7:00 AM...');
+cron.schedule("0 7 * * *", async () => {
+  console.log("⏰ Running daily digest at 7:00 AM...");
   await sendDailyDigestNotifications();
 });
 
-cron.schedule('0 8 * * *', async () => {
-  console.log('⏰ Running daily digest at 8:00 AM...');
+cron.schedule("0 8 * * *", async () => {
+  console.log("⏰ Running daily digest at 8:00 AM...");
   await sendDailyDigestNotifications();
 });
 
 // ----- API Endpoints -----
-app.get('/health', (_req, res) => {
-  res.status(200).json({ 
-    status: 'ok',
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    status: "ok",
     cache: cacheStatus,
-    events: cachedRecent.length
+    events: cachedRecent.length,
   });
 });
 
-app.get('/events', async (req, res) => {
+app.get("/events", async (req, res) => {
   const { section, date } = req.query;
 
-  if (cacheStatus === 'building' && cachedRecent.length === 0) {
-    return res.status(503).json({ 
-      error: 'Cache still building, retry in 30s',
-      status: cacheStatus
+  if (cacheStatus === "building" && cachedRecent.length === 0) {
+    return res.status(503).json({
+      error: "Cache still building, retry in 30s",
+      status: cacheStatus,
     });
   }
 
   try {
-    const todayISO = new Date().toISOString().split('T')[0];
+    const todayISO = new Date().toISOString().split("T")[0];
 
     if (Date.now() - recentBuiltAt > 15 * 60 * 1000) {
       (async () => {
@@ -931,16 +1053,16 @@ app.get('/events', async (req, res) => {
         let d;
         if (e.isAllDay) {
           d = e.start;
-        } else if (typeof e.start === 'string' && e.start.length === 10) {
+        } else if (typeof e.start === "string" && e.start.length === 10) {
           d = e.start;
         } else if (e.start instanceof Date) {
-          d = e.start.toISOString().split('T')[0];
-        } else if (typeof e.start === 'string') {
-          d = e.start.split('T')[0];
+          d = e.start.toISOString().split("T")[0];
+        } else if (typeof e.start === "string") {
+          d = e.start.split("T")[0];
         } else {
           return false;
         }
-        
+
         if (d !== date) return false;
         const text = `${e.summary} ${e.description}`;
         return text.includes(section);
@@ -949,35 +1071,48 @@ app.get('/events', async (req, res) => {
     }
 
     if (section) {
-      const bySection = cachedByDay[todayISO] || cachedByDay[lastDayBuilt] || {};
+      const bySection =
+        cachedByDay[todayISO] || cachedByDay[lastDayBuilt] || {};
       return res.json(bySection[section] || []);
     }
 
     return res.json(cachedRecent);
   } catch (err) {
-    console.error('❌ Handler error:', err.message, err.stack);
-    return res.status(500).json({ error: 'Internal error' });
+    console.error("❌ Handler error:", err.message, err.stack);
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 
-app.post('/register-token', async (req, res) => {
+app.post("/register-token", async (req, res) => {
   try {
-    const { token, subscription, section, professor, digestEnabled, digestTime, realtimeEnabled } = req.body;
+    const {
+      token,
+      subscription,
+      section,
+      professor,
+      digestEnabled,
+      digestTime,
+      realtimeEnabled,
+    } = req.body;
 
     const notificationData = token || subscription;
-    
+
     if (!notificationData) {
-      return res.status(400).json({ error: 'Token or subscription is required' });
+      return res
+        .status(400)
+        .json({ error: "Token or subscription is required" });
     }
 
     const type = getNotificationType(notificationData);
-    
-    if (type === 'unknown') {
-      return res.status(400).json({ error: 'Invalid token or subscription format' });
+
+    if (type === "unknown") {
+      return res
+        .status(400)
+        .json({ error: "Invalid token or subscription format" });
     }
 
     let docId;
-    if (typeof notificationData === 'string') {
+    if (typeof notificationData === "string") {
       docId = notificationData;
     } else if (notificationData.endpoint) {
       docId = notificationData.endpoint;
@@ -986,91 +1121,104 @@ app.post('/register-token', async (req, res) => {
     }
 
     const tokenData = {
-      token: typeof notificationData === 'string' 
-        ? notificationData 
-        : JSON.stringify(notificationData),
+      token:
+        typeof notificationData === "string"
+          ? notificationData
+          : JSON.stringify(notificationData),
       type: type,
-      section: section || null,
-      professor: professor || null,
+      section: section ? section.toUpperCase().trim() : null,
+      professor: professor ? professor.toUpperCase().trim() : null,
       digestEnabled: digestEnabled !== undefined ? digestEnabled : true,
-      digestTime: digestTime || '06:00',
+      digestTime: digestTime || "06:00",
       realtimeEnabled: realtimeEnabled !== undefined ? realtimeEnabled : true,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    await db.collection('tokens').doc(docId).set(tokenData, { merge: true });
+    await db.collection("tokens").doc(docId).set(tokenData, { merge: true });
 
-    console.log(`✅ ${type.toUpperCase()} token registered: ${docId.substring(0, 30)}...`);
-    res.json({ success: true, message: 'Token registered successfully', type });
+    console.log(
+      `✅ ${type.toUpperCase()} token registered: ${docId.substring(0, 30)}...`
+    );
+    res.json({ success: true, message: "Token registered successfully", type });
   } catch (error) {
-    console.error('❌ Error registering token:', error);
-    res.status(500).json({ error: 'Failed to register token' });
+    console.error("❌ Error registering token:", error);
+    res.status(500).json({ error: "Failed to register token" });
   }
 });
 
-app.post('/unregister-token', async (req, res) => {
+app.post("/unregister-token", async (req, res) => {
   try {
     const { token } = req.body;
 
     if (!token) {
-      return res.status(400).json({ error: 'Token is required' });
+      return res.status(400).json({ error: "Token is required" });
     }
 
-    await db.collection('tokens').doc(token).delete();
+    await db.collection("tokens").doc(token).delete();
 
     console.log(`✅ Token unregistered: ${token.substring(0, 20)}...`);
-    res.json({ success: true, message: 'Token unregistered successfully' });
+    res.json({ success: true, message: "Token unregistered successfully" });
   } catch (error) {
-    console.error('❌ Error unregistering token:', error);
-    res.status(500).json({ error: 'Failed to unregister token' });
+    console.error("❌ Error unregistering token:", error);
+    res.status(500).json({ error: "Failed to unregister token" });
   }
 });
 
-app.post('/update-preferences', async (req, res) => {
+app.post("/update-preferences", async (req, res) => {
   try {
-    const { token, section, professor, digestEnabled, digestTime, realtimeEnabled } = req.body;
+    const {
+      token,
+      section,
+      professor,
+      digestEnabled,
+      digestTime,
+      realtimeEnabled,
+    } = req.body;
 
     if (!token) {
-      return res.status(400).json({ error: 'Token is required' });
+      return res.status(400).json({ error: "Token is required" });
     }
 
     const updates = {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (section !== undefined) updates.section = section;
-    if (professor !== undefined) updates.professor = professor;
+    if (section !== undefined)
+      updates.section = section ? section.toUpperCase().trim() : null;
+    if (professor !== undefined)
+      updates.professor = professor ? professor.toUpperCase().trim() : null;
     if (digestEnabled !== undefined) updates.digestEnabled = digestEnabled;
     if (digestTime !== undefined) updates.digestTime = digestTime;
-    if (realtimeEnabled !== undefined) updates.realtimeEnabled = realtimeEnabled;
+    if (realtimeEnabled !== undefined)
+      updates.realtimeEnabled = realtimeEnabled;
 
-    await db.collection('tokens').doc(token).update(updates);
+    await db.collection("tokens").doc(token).update(updates);
 
     console.log(`✅ Preferences updated for: ${token.substring(0, 20)}...`);
-    res.json({ success: true, message: 'Preferences updated successfully' });
+    res.json({ success: true, message: "Preferences updated successfully" });
   } catch (error) {
-    console.error('❌ Error updating preferences:', error);
-    res.status(500).json({ error: 'Failed to update preferences' });
+    console.error("❌ Error updating preferences:", error);
+    res.status(500).json({ error: "Failed to update preferences" });
   }
 });
 
-app.get('/vapid-public-key', (req, res) => {
+app.get("/vapid-public-key", (req, res) => {
   if (!process.env.VAPID_PUBLIC_KEY) {
-    return res.status(503).json({ error: 'Web Push not configured' });
+    return res.status(503).json({ error: "Web Push not configured" });
   }
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
 });
 
-app.get('/admin/token-stats', async (req, res) => {
+app.get("/admin/token-stats", async (req, res) => {
   try {
     const { adminKey } = req.query;
-    
+
     if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
-      return res.status(403).json({ error: 'Unauthorized' });
+      return res.status(403).json({ error: "Unauthorized" });
     }
 
-    const tokensSnapshot = await db.collection('tokens').get();
-    
+    const tokensSnapshot = await db.collection("tokens").get();
+
     const stats = {
       total: tokensSnapshot.size,
       expo: 0,
@@ -1080,17 +1228,19 @@ app.get('/admin/token-stats', async (req, res) => {
       byProfessor: {},
     };
 
-    tokensSnapshot.forEach(doc => {
+    tokensSnapshot.forEach((doc) => {
       const data = doc.data();
       const token = data.token;
       const type = getNotificationType(token);
       stats[type]++;
-      
+
       if (data.section) {
-        stats.bySection[data.section] = (stats.bySection[data.section] || 0) + 1;
+        stats.bySection[data.section] =
+          (stats.bySection[data.section] || 0) + 1;
       }
       if (data.professor) {
-        stats.byProfessor[data.professor] = (stats.byProfessor[data.professor] || 0) + 1;
+        stats.byProfessor[data.professor] =
+          (stats.byProfessor[data.professor] || 0) + 1;
       }
     });
 
@@ -1101,22 +1251,22 @@ app.get('/admin/token-stats', async (req, res) => {
 });
 
 // ----- Server Startup -----
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`⏳ Building cache in background...`);
 });
 
 (async function buildInitialCache() {
   try {
-    console.log('🔄 Initial calendar fetch...');
+    console.log("🔄 Initial calendar fetch...");
     await fetchAndRebuildCache();
-    cacheStatus = 'ready';
-    console.log('✅ Cache ready');
-    
+    cacheStatus = "ready";
+    console.log("✅ Cache ready");
+
     setTimeout(backgroundRefresh, REFRESH_MS);
   } catch (error) {
-    console.error('❌ Initial fetch failed:', error.message);
-    cacheStatus = 'error';
+    console.error("❌ Initial fetch failed:", error.message);
+    cacheStatus = "error";
     setTimeout(backgroundRefresh, 30000);
   }
 })();
