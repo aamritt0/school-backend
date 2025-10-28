@@ -523,24 +523,40 @@ async function fetchAndRebuildCache() {
 // ----- Notification Functions -----
 
 function getNotificationType(tokenOrSubscription) {
-  if (!tokenOrSubscription) return "unknown";
+  if (!tokenOrSubscription) {
+    console.log("⚠️ getNotificationType: null/undefined input");
+    return "unknown";
+  }
+
+  console.log("🔍 getNotificationType input type:", typeof tokenOrSubscription);
 
   if (typeof tokenOrSubscription === "string") {
+    console.log("🔍 String token, checking if Expo...");
     if (Expo.isExpoPushToken(tokenOrSubscription)) {
+      console.log("✅ Detected as Expo token");
       return "expo";
     }
+
+    console.log("🔍 Not Expo, checking if JSON...");
     if (tokenOrSubscription.startsWith("{")) {
       try {
         const parsed = JSON.parse(tokenOrSubscription);
-        if (parsed.endpoint) return "webpush";
-      } catch (e) {}
+        if (parsed.endpoint) {
+          console.log("✅ Detected as Web Push (JSON string)");
+          return "webpush";
+        }
+      } catch (e) {
+        console.error("❌ Failed to parse JSON:", e.message);
+      }
     }
   }
 
   if (typeof tokenOrSubscription === "object" && tokenOrSubscription.endpoint) {
+    console.log("✅ Detected as Web Push (object)");
     return "webpush";
   }
 
+  console.log("❌ Unknown token type");
   return "unknown";
 }
 
@@ -1020,10 +1036,16 @@ cron.schedule("0 8 * * *", async () => {
 
 // ----- API Endpoints -----
 app.get("/health", (_req, res) => {
+  const firebaseStatus =
+    admin.apps.length > 0 ? "initialized" : "not initialized";
+
   res.status(200).json({
     status: "ok",
     cache: cacheStatus,
     events: cachedRecent.length,
+    firebase: firebaseStatus,
+    expo: "initialized",
+    webpush: process.env.VAPID_PUBLIC_KEY ? "configured" : "not configured",
   });
 });
 
@@ -1083,8 +1105,13 @@ app.get("/events", async (req, res) => {
   }
 });
 
+// Improved /register-token endpoint with better error handling
 app.post("/register-token", async (req, res) => {
   try {
+    console.log("📥 Received registration request:", {
+      body: JSON.stringify(req.body).substring(0, 200),
+    });
+
     const {
       token,
       subscription,
@@ -1098,19 +1125,36 @@ app.post("/register-token", async (req, res) => {
     const notificationData = token || subscription;
 
     if (!notificationData) {
+      console.error("❌ Missing token or subscription");
       return res
         .status(400)
         .json({ error: "Token or subscription is required" });
     }
 
+    console.log("🔍 Notification data type:", typeof notificationData);
+    console.log(
+      "🔍 Notification data preview:",
+      typeof notificationData === "string"
+        ? notificationData.substring(0, 50) + "..."
+        : JSON.stringify(notificationData).substring(0, 50) + "..."
+    );
+
     const type = getNotificationType(notificationData);
+    console.log("🔍 Detected type:", type);
 
     if (type === "unknown") {
-      return res
-        .status(400)
-        .json({ error: "Invalid token or subscription format" });
+      console.error("❌ Invalid token format");
+      return res.status(400).json({
+        error: "Invalid token or subscription format",
+        detectedType: type,
+        tokenPreview:
+          typeof notificationData === "string"
+            ? notificationData.substring(0, 50)
+            : "object",
+      });
     }
 
+    // Create document ID
     let docId;
     if (typeof notificationData === "string") {
       docId = notificationData;
@@ -1120,6 +1164,9 @@ app.post("/register-token", async (req, res) => {
       docId = JSON.stringify(notificationData);
     }
 
+    console.log("📝 Document ID:", docId.substring(0, 50) + "...");
+
+    // Prepare token data
     const tokenData = {
       token:
         typeof notificationData === "string"
@@ -1132,17 +1179,48 @@ app.post("/register-token", async (req, res) => {
       digestTime: digestTime || "06:00",
       realtimeEnabled: realtimeEnabled !== undefined ? realtimeEnabled : true,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
+    console.log("💾 Saving to Firestore:", {
+      docId: docId.substring(0, 30) + "...",
+      type: tokenData.type,
+      section: tokenData.section,
+      professor: tokenData.professor,
+      digestEnabled: tokenData.digestEnabled,
+      realtimeEnabled: tokenData.realtimeEnabled,
+    });
+
+    // Save to Firestore
     await db.collection("tokens").doc(docId).set(tokenData, { merge: true });
 
     console.log(
-      `✅ ${type.toUpperCase()} token registered: ${docId.substring(0, 30)}...`
+      `✅ ${type.toUpperCase()} token registered successfully: ${docId.substring(
+        0,
+        30
+      )}...`
     );
-    res.json({ success: true, message: "Token registered successfully", type });
+
+    res.json({
+      success: true,
+      message: "Token registered successfully",
+      type,
+      docId: docId.substring(0, 30) + "...",
+      data: {
+        section: tokenData.section,
+        professor: tokenData.professor,
+        digestEnabled: tokenData.digestEnabled,
+        realtimeEnabled: tokenData.realtimeEnabled,
+      },
+    });
   } catch (error) {
     console.error("❌ Error registering token:", error);
-    res.status(500).json({ error: "Failed to register token" });
+    console.error("❌ Error stack:", error.stack);
+    res.status(500).json({
+      error: "Failed to register token",
+      message: error.message,
+      stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
+    });
   }
 });
 
