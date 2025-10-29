@@ -68,6 +68,43 @@ let cacheStatus = "building";
 let lastSentEventIds = new Set();
 
 // ----- Helper Functions -----
+
+/**
+ * Generate a safe Firestore document ID from a token/subscription
+ * @param {string|object} tokenOrSubscription - Expo token or Web Push subscription
+ * @returns {string} Safe document ID
+ */
+function generateSafeDocId(tokenOrSubscription) {
+  if (typeof tokenOrSubscription === "string") {
+    // Check if it's an Expo token
+    if (Expo.isExpoPushToken(tokenOrSubscription)) {
+      return tokenOrSubscription;
+    }
+    
+    // Try to parse as Web Push subscription
+    try {
+      const parsed = JSON.parse(tokenOrSubscription);
+      if (parsed.endpoint) {
+        return Buffer.from(parsed.endpoint).toString('base64').replace(/[\/+=]/g, '-');
+      }
+    } catch (e) {
+      // If parsing fails, hash the entire string
+    }
+    
+    // Hash the string for safety
+    return Buffer.from(tokenOrSubscription).toString('base64').replace(/[\/+=]/g, '-');
+  } else if (
+    typeof tokenOrSubscription === "object" &&
+    tokenOrSubscription.endpoint
+  ) {
+    // Web Push subscription object
+    return Buffer.from(tokenOrSubscription.endpoint).toString('base64').replace(/[\/+=]/g, '-');
+  } else {
+    // Fallback: stringify and hash
+    return Buffer.from(JSON.stringify(tokenOrSubscription)).toString('base64').replace(/[\/+=]/g, '-');
+  }
+}
+
 function unescapeICSText(text) {
   if (!text) return "";
   return text
@@ -562,21 +599,11 @@ function getNotificationType(tokenOrSubscription) {
 
 async function deleteToken(tokenOrSubscription) {
   try {
-    let tokenId;
-    if (typeof tokenOrSubscription === "string") {
-      tokenId = tokenOrSubscription;
-    } else if (
-      typeof tokenOrSubscription === "object" &&
-      tokenOrSubscription.endpoint
-    ) {
-      tokenId = tokenOrSubscription.endpoint;
-    } else {
-      tokenId = JSON.stringify(tokenOrSubscription);
-    }
-
+    const tokenId = generateSafeDocId(tokenOrSubscription);
     await db.collection("tokens").doc(tokenId).delete();
+    console.log(`🗑️ Deleted token: ${tokenId.substring(0, 30)}...`);
   } catch (error) {
-    console.error("Failed to delete token:", error.message);
+    console.error("❌ Failed to delete token:", error.message);
   }
 }
 
@@ -1105,7 +1132,6 @@ app.get("/events", async (req, res) => {
   }
 });
 
-// Improved /register-token endpoint with better error handling
 app.post("/register-token", async (req, res) => {
   try {
     console.log("📥 Received registration request:", {
@@ -1154,19 +1180,11 @@ app.post("/register-token", async (req, res) => {
       });
     }
 
-    // Create document ID
-    let docId;
-    if (typeof notificationData === "string") {
-      docId = notificationData;
-    } else if (notificationData.endpoint) {
-      docId = notificationData.endpoint;
-    } else {
-      docId = JSON.stringify(notificationData);
-    }
-
+    // Generate safe Firestore document ID
+    const docId = generateSafeDocId(notificationData);
     console.log("📝 Document ID:", docId.substring(0, 50) + "...");
 
-    // Prepare token data
+    // Prepare token data - store original subscription for Web Push
     const tokenData = {
       token:
         typeof notificationData === "string"
@@ -1232,9 +1250,11 @@ app.post("/unregister-token", async (req, res) => {
       return res.status(400).json({ error: "Token is required" });
     }
 
-    await db.collection("tokens").doc(token).delete();
+    // Generate the same safe ID used during registration
+    const tokenId = generateSafeDocId(token);
+    await db.collection("tokens").doc(tokenId).delete();
 
-    console.log(`✅ Token unregistered: ${token.substring(0, 20)}...`);
+    console.log(`✅ Token unregistered: ${tokenId.substring(0, 20)}...`);
     res.json({ success: true, message: "Token unregistered successfully" });
   } catch (error) {
     console.error("❌ Error unregistering token:", error);
@@ -1257,6 +1277,9 @@ app.post("/update-preferences", async (req, res) => {
       return res.status(400).json({ error: "Token is required" });
     }
 
+    // Generate the same safe ID used during registration
+    const tokenId = generateSafeDocId(token);
+
     const updates = {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -1270,9 +1293,9 @@ app.post("/update-preferences", async (req, res) => {
     if (realtimeEnabled !== undefined)
       updates.realtimeEnabled = realtimeEnabled;
 
-    await db.collection("tokens").doc(token).update(updates);
+    await db.collection("tokens").doc(tokenId).update(updates);
 
-    console.log(`✅ Preferences updated for: ${token.substring(0, 20)}...`);
+    console.log(`✅ Preferences updated for: ${tokenId.substring(0, 20)}...`);
     res.json({ success: true, message: "Preferences updated successfully" });
   } catch (error) {
     console.error("❌ Error updating preferences:", error);
