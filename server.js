@@ -877,10 +877,18 @@ async function sendDailyDigestNotifications() {
     const results = await sendNotificationBatch(
       recipients,
       () => "📋 Variazioni di oggi",
-      (r) =>
-        r.events.length === 1
-          ? r.events[0].summary
-          : `${r.events.length} variazioni per ${r.section || r.professor}`,
+      (r) => {
+        if (r.events.length === 1) {
+          return r.events[0].summary;
+        }
+        let body = r.events
+          .map((e) => `• ${e.summary}`)
+          .join("\n");
+        if (body.length > 400) {
+          body = body.substring(0, 397) + "...";
+        }
+        return body;
+      },
       (r) => ({
         type: "digest",
         section: r.section || "",
@@ -1008,12 +1016,18 @@ async function checkAndSendRealTimeNotifications(morningDigestHour = null) {
     const results = await sendNotificationBatch(
       recipients,
       () => "🔔 Nuova variazione!",
-      (r) =>
-        r.events.length === 1
-          ? r.events[0].summary
-          : `${r.events.length} nuove variazioni per ${
-              r.section || r.professor
-            }`,
+      (r) => {
+        if (r.events.length === 1) {
+          return r.events[0].summary;
+        }
+        let body = r.events
+          .map((e) => `• ${e.summary}`)
+          .join("\n");
+        if (body.length > 400) {
+          body = body.substring(0, 397) + "...";
+        }
+        return body;
+      },
       (r) => ({
         type: "realtime",
         section: r.section || "",
