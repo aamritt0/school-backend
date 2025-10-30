@@ -897,14 +897,30 @@ async function sendDailyDigestNotifications() {
   }
 }
 
-async function checkAndSendRealTimeNotifications() {
+async function checkAndSendRealTimeNotifications(morningDigestHour = null) {
   try {
     console.log("🔔 Checking for new events...");
 
-    const tokensSnapshot = await db
+    let tokensQuery = db
       .collection("tokens")
-      .where("realtimeEnabled", "==", true)
-      .get();
+      .where("realtimeEnabled", "==", true);
+
+    if (morningDigestHour) {
+      const excludedTimes = [];
+      if (morningDigestHour < 7) excludedTimes.push("07:00");
+      if (morningDigestHour < 8) excludedTimes.push("08:00");
+
+      if (excludedTimes.length > 0) {
+        console.log(
+          `🌅 Morning run, excluding users with digest times: ${excludedTimes.join(
+            ", "
+          )}`
+        );
+        tokensQuery = tokensQuery.where("digestTime", "not-in", excludedTimes);
+      }
+    }
+
+    const tokensSnapshot = await tokensQuery.get();
 
     if (tokensSnapshot.empty) {
       console.log("📭 No tokens with realtime enabled");
@@ -1042,24 +1058,42 @@ async function backgroundRefresh() {
 
 // ----- Cron Jobs -----
 cron.schedule("*/10 * * * *", async () => {
+  const now = new Date();
+  const hour = now.getHours();
+  const minute = now.getMinutes();
+
+  // Pause real-time checks from midnight up to 8:10 AM to ensure digests are sent first.
+  if (hour < 8 || (hour === 8 && minute <= 10)) {
+    console.log(
+      "🤫 Real-time notifications paused during morning digest window."
+    );
+    return;
+  }
+
   console.log("⏰ Running real-time notification check...");
   await checkAndSendRealTimeNotifications();
 });
 
-cron.schedule("0 6 * * *", async () => {
-  console.log("⏰ Running daily digest at 6:00 AM...");
-  await sendDailyDigestNotifications();
-});
+async function runMorningJobs(hour) {
+  console.log(`⏰ Running morning sequence for ${hour}:00 AM...`);
+  try {
+    console.log("  - 1/3: Fetching latest events...");
+    await fetchAndRebuildCache();
+    console.log("  - 2/3: Sending daily digests...");
+    await sendDailyDigestNotifications();
+    console.log("  - 3/3: Checking for new events post-digest...");
+    await checkAndSendRealTimeNotifications(hour);
+    console.log(`✅ Morning sequence complete for ${hour}:00 AM`);
+  } catch (error) {
+    console.error(`❌ Error during ${hour}:00 AM morning sequence:`, error);
+  }
+}
 
-cron.schedule("0 7 * * *", async () => {
-  console.log("⏰ Running daily digest at 7:00 AM...");
-  await sendDailyDigestNotifications();
-});
+cron.schedule("0 6 * * *", () => runMorningJobs(6));
 
-cron.schedule("0 8 * * *", async () => {
-  console.log("⏰ Running daily digest at 8:00 AM...");
-  await sendDailyDigestNotifications();
-});
+cron.schedule("0 7 * * *", () => runMorningJobs(7));
+
+cron.schedule("0 8 * * *", () => runMorningJobs(8));
 
 // ----- API Endpoints -----
 app.get("/health", (_req, res) => {
